@@ -60,7 +60,7 @@
 
   <ItemGroup>
     <!-- Image identification + recompression (polyglot-tail mitigation) -->
-    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
 
     <!-- Source Link: maps debug symbols back to the GitHub source tree -->
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />

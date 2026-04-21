@@ -91,7 +91,7 @@ public static class Program
 
     private static FileContentValidator BuildValidator()
     {
-        var options = Options.Create(new FileContentValidatorOptions
+        var options = Microsoft.Extensions.Options.Options.Create(new FileContentValidatorOptions
         {
             // Cap the per-input work to keep the fuzz loop fast. AFL prefers
             // many short executions over a few long ones.
