@@ -1,0 +1,232 @@
+# secure-file-upload-dotnet
+
+**Production-grade, defense-in-depth file upload security for ASP.NET Core 8+**
+
+This repository contains the complete C# file upload security pipeline from a live public-sector ASP.NET Core 8 application — a patron registration system for a public library. The code is real production code, not a toy example. It has been de-branded and generalized for community use.
+
+The companion `SECURITY-ANALYSIS.md` documents a structured adversarial AI red-team review of this exact code, including real findings, honest gaps, and recommendations.
+
+> *"So whether you eat or drink or whatever you do, do it all for the glory of God."*
+> — 1 Corinthians 10:31
+
+---
+
+## Why This Exists
+
+Secure file upload is one of the most consistently mishandled areas in web development. Most tutorials show you how to *receive* a file. Very few show you how to defend against:
+
+- Polyglot files (valid image + embedded executable)
+- Double-extension attacks (`photo.pdf.exe`)
+- MIME spoofing
+- Magic-byte forgery
+- Path traversal via filename manipulation
+- PDF JavaScript injection
+- ZIP bomb / pixel flood attacks
+- Log poisoning via crafted filenames
+- Disk exhaustion attacks
+
+This codebase addresses all of them, and the red-team analysis tells you where it still falls short.
+
+---
+
+## The 8-Layer Validation Pipeline
+
+Every uploaded file passes through all layers in order. **Failure at any layer rejects the file immediately.** The pipeline is fail-closed: unknown types are rejected, not passed.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     INCOMING FILE UPLOAD                         │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+          ┌───────────────▼────────────────┐
+          │  Layer 1: File Size Check       │  Rejects oversized files before any buffering
+          │  (per-file and total batch)     │  Also enforces minimum size per format
+          └───────────────┬────────────────┘
+                          │
+          ┌───────────────▼────────────────┐
+          │  Layer 2: Extension Allowlist   │  Strict allowlist: .jpg .jpeg .png .webp .pdf
+          │                                 │  Everything else is rejected
+          └───────────────┬────────────────┘
+                          │
+          ┌───────────────▼────────────────┐
+          │  Layer 3: MIME + Extension      │  Browser-reported MIME must match extension
+          │  Cross-Validation               │  Catches extension-spoofed uploads
+          └───────────────┬────────────────┘
+                          │
+          ┌───────────────▼────────────────┐
+          │  Layer 4: Magic Bytes           │  File signature read from actual bytes
+          │  (File Signature Check)         │  Not from filename or Content-Type header
+          └───────────────┬────────────────┘
+                          │
+          ┌───────────────▼────────────────┐
+          │  Layer 5: Filename Inspection   │  Double-extension, Unicode tricks,
+          │                                 │  path traversal, reserved names (NUL, COM1...)
+          └───────────────┬────────────────┘
+                          │
+          ┌───────────────▼────────────────┐
+          │  Layer 6: Deep Content          │  Format-specific structural walking:
+          │  Validation (FileContentValidator) │  JPEG segment walker, PNG chunk walker,
+          │                                 │  WebP RIFF tree, PDF pattern scan
+          │                                 │  Detects embedded executables, scripts,
+          │                                 │  JavaScript in PDF, dangerous PDF objects
+          └───────────────┬────────────────┘
+                          │
+          ┌───────────────▼────────────────┐
+          │  Layer 7: Virus Scan            │  Windows Defender (MpCmdRun.exe) or ClamAV
+          │  (IVirusScanService)            │  Fail-closed: scanner unavailable = rejection
+          │                                 │  Only runs when VirusScan:Enabled=true
+          └───────────────┬────────────────┘
+                          │
+          ┌───────────────▼────────────────┐
+          │  Layer 8: Encrypted Storage     │  AES-256-GCM authenticated encryption
+          │                                 │  Randomized filename, outside wwwroot,
+          │                                 │  path traversal re-checked before write
+          └───────────────┴────────────────┘
+```
+
+---
+
+## Source Files
+
+| File | Purpose |
+|------|---------|
+| `src/FileUploadService.cs` | Orchestrates the full 8-layer pipeline. Handles batch limits, disk capacity checks, encrypted write, decryption for retrieval. |
+| `src/FileContentValidator.cs` | Layer 6 deep content validation. Format-specific structural walking for JPEG, PNG, WebP, PDF. Pattern-based threat detection. Fail-closed on unknown types. |
+| `src/WindowsDefenderScanService.cs` | Layer 7 virus scanning via Windows Defender MpCmdRun.exe. Includes temp-file secure delete (zero-before-delete). |
+| `src/ReplacementCardInputModel.cs` | Example model showing how file uploads are bound via `List<IFormFile>` in a multipart form alongside validated patron fields. |
+
+---
+
+## Key Design Decisions (and Why)
+
+### Fail-Closed Throughout
+Unknown file types, unavailable scanners, exceptions in validation — all result in rejection. The default is **deny**, not allow. This is the single most important design decision in the entire codebase.
+
+### Signature-First Classification (FileContentValidator)
+The deep validator detects the *actual* file type from magic bytes before dispatching to the format-specific validator. A file claiming to be `.jpg` that opens with `%PDF` gets caught as a type mismatch before any format-specific logic runs.
+
+### Extension ↔ MIME Cross-Validation (Layer 3)
+The browser-reported `Content-Type` header is validated against the claimed extension. A `.pdf` file arriving with `image/jpeg` MIME is rejected. Neither the extension nor the MIME type is trusted independently.
+
+### Storage Outside wwwroot (Layer 8)
+The storage root is validated at construction time to be outside `wwwroot`. If someone misconfigures the path to resolve inside the web root (where files would be directly servable), the application **refuses to start**. This is enforced at the `IWebHostEnvironment` level, not just as documentation.
+
+### Randomized Filenames
+Files are stored as `{sanitizedLastName}{dateStamp}{formType}Doc{n}{randomSuffix}.ext`. The original filename is never used on disk. This prevents filename-based path traversal and removes any attacker control over the final storage path.
+
+### AES-256-GCM with PBKDF2
+When encryption is enabled, files are encrypted with AES-256-GCM (authenticated encryption). The key is derived via PBKDF2-SHA256 at 600,000 iterations (OWASP 2024 recommendation). The application refuses to start if `EncryptionEnabled=true` but the secret is missing or still set to the placeholder.
+
+### Secure Temp File Deletion (WindowsDefenderScanService)
+The virus scanner writes files to a temp directory for scanning. After scanning, the temp file is overwritten with zeros before deletion. This reduces (though does not guarantee) recovery of sensitive content from freed disk sectors.
+
+### ArrayPool + Buffer Zeroing (FileContentValidator)
+Content validation uses `ArrayPool<byte>` for the read buffer. The buffer is **zeroed before being returned to the pool** to prevent patron document content (IDs, utility bills) from leaking into subsequent requests.
+
+### PathHelper.IsPathUnderBase (Not StartsWith)
+Path traversal checks use a proper base-path check rather than `string.StartsWith`. The `StartsWith` approach has a well-known prefix confusion bug: `/uploads_evil` matches `/uploads` when doing naive prefix checking. The helper uses canonicalized paths and directory separator boundary checks.
+
+---
+
+## Configuration Reference
+
+```json
+{
+  "FileUpload": {
+    "StorageRoot": "../uploads",
+    "MaxFileSizeBytes": 10485760,
+    "MaxFileCount": 5,
+    "MaxTotalUploadBytes": 52428800,
+    "MinStorageFreeBytes": 536870912,
+    "MinTempFreeBytes": 536870912,
+    "LowDiskWarningBytes": 2147483648,
+    "EncryptionEnabled": false,
+    "EncryptionSecret": "CHANGE_THIS_TO_A_REAL_SECRET_MINIMUM_32_CHARS"
+  },
+  "VirusScan": {
+    "Enabled": false,
+    "WindowsDefender": {
+      "MpCmdRunPath": "C:\\Program Files\\Windows Defender\\MpCmdRun.exe",
+      "TempScanPath": "C:\\Temp\\VirusScan",
+      "TimeoutSeconds": 30
+    }
+  }
+}
+```
+
+**StorageRoot** is resolved relative to `ContentRootPath` (not `wwwRootPath`). A relative path like `../uploads` is typical to ensure it lands outside the web root.
+
+**EncryptionSecret** must be at least 32 characters and must not contain the string `CHANGE_THIS`. If `EncryptionEnabled` is true and the secret fails this check, **the application will not start**.
+
+---
+
+## Dependencies
+
+- .NET 8+
+- [SixLabors.ImageSharp](https://github.com/SixLabors/ImageSharp) — used in `FileContentValidator` for `Image.Identify()` (structural validation without full pixel decode)
+- Windows Defender (`MpCmdRun.exe`) for Layer 7 — or swap in ClamAV by implementing `IVirusScanService`
+
+---
+
+## Integration Pattern
+
+```csharp
+// Program.cs / Startup registration
+builder.Services.AddSingleton<FileContentValidator>();
+builder.Services.AddSingleton<IVirusScanService, WindowsDefenderScanService>();
+builder.Services.AddSingleton<IFileUploadService, FileUploadService>();
+
+// Configure multipart body size limit to match your FileUpload:MaxTotalUploadBytes
+builder.Services.Configure<FormOptions>(options =>
+{
+    options.MultipartBodyLengthLimit = 53_477_376; // 51 MB
+});
+```
+
+```csharp
+// Controller usage
+[HttpPost]
+[RequestSizeLimit(53_477_376)]
+public async Task<IActionResult> Submit(MyInputModel model)
+{
+    if (!ModelState.IsValid)
+        return View(model);
+
+    var files = Request.Form.Files;
+    var result = await _fileUploadService.UploadFilesAsync(files, model.LastName, "remote");
+
+    if (!result.Success)
+    {
+        // result.Errors contains user-safe messages
+        // result.WorkflowOutcome: AllSaved | PartialSaved | AllRejected | NoFiles
+        foreach (var error in result.Errors)
+            ModelState.AddModelError(string.Empty, error);
+        return View(model);
+    }
+    // ...
+}
+```
+
+---
+
+## Docs
+
+- [`docs/threat-model.md`](docs/threat-model.md) — What attack each layer defeats
+- [`docs/pipeline-diagram.md`](docs/pipeline-diagram.md) — Detailed flow with edge cases
+- [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) — AI red-team adversarial findings
+- [`KNOWN-GAPS.md`](KNOWN-GAPS.md) — Honest limitations and what this does NOT protect against
+
+---
+
+## License
+
+MIT. Use freely. Attribution appreciated but not required.
+
+---
+
+## Contributing
+
+Issues and PRs welcome, especially:
+- ClamAV implementation of `IVirusScanService` (Linux/cross-platform alternative to Windows Defender)
+- Unit test coverage for the validation layers
+- Additional format validators (GIF, BMP deep content validation)

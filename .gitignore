@@ -1,0 +1,21 @@
+# Build outputs
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Secrets — NEVER commit these
+appsettings.Production.json
+appsettings.secrets.json
+*.pfx
+*.key
+
+# Upload storage — should never be in source control
+uploads/
+scan-temp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
