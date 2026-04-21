@@ -103,7 +103,9 @@ namespace SecureFileUpload.Services
 
         /// <summary>
         /// Scans an uploaded file for viruses/malware.
-        /// If scanner unavailable, returns failed result (fail-closed).
+        /// If the scanner binary is unavailable, returns ScanSuccessful=false.
+        /// The calling pipeline accepts that as NotScanned (fail-open on availability).
+        /// See ScanStreamAsync and KNOWN-GAPS.md §Gap 9.
         /// </summary>
         public async Task<VirusScanResult> ScanFileAsync(IFormFile file)
         {
@@ -137,7 +139,10 @@ namespace SecureFileUpload.Services
 
         /// <summary>
         /// Scans a file stream for viruses/malware.
-        /// Fail-closed: if scanner is unavailable, file is rejected (not silently passed).
+        /// If the scanner binary is unavailable, returns ScanSuccessful=false.
+        /// Detection fail-closed: infected result → pipeline rejects.
+        /// Availability fail-open: ScanSuccessful=false → pipeline accepts as NotScanned
+        ///   (never silently relabelled as clean). See KNOWN-GAPS.md §Gap 9.
         ///
         /// The stream must be seekable (CanSeek == true) since its Position is
         /// reset to 0 before reading. IFormFile.OpenReadStream() satisfies this;
@@ -150,22 +155,24 @@ namespace SecureFileUpload.Services
 
             try
             {
-                // Fail-closed: if scanner binary is missing, reject the file.
-                // Checked live (not cached) so the service recovers if Defender
+                // Scanner binary is missing — return ScanSuccessful=false.
+                // The pipeline will accept this file as NotScanned (fail-open on
+                // availability). Checked live so the service recovers if Defender
                 // is installed or restored after application startup.
                 if (!IsScannerAvailable)
                 {
                     sw.Stop();
                     _logger.LogError(
                         "SECURITY_EVENT | SCANNER_UNAVAILABLE | Windows Defender not available - " +
-                        "file {FileName} REJECTED (fail-closed). Install Defender or configure ClamAV.",
+                        "file {FileName} will be accepted as NotScanned by the pipeline. " +
+                        "Install Defender or configure ClamAV to restore scanning.",
                         fileName);
 
                     return new VirusScanResult
                     {
                         IsClean = false,
                         ScanSuccessful = false,
-                        Message = "Scanner not available - file rejected (fail-closed policy)",
+                        Message = "Scanner not available — file accepted as NotScanned by pipeline (see KNOWN-GAPS.md §Gap 9)",
                         ScannerUsed = $"{ScannerName} (unavailable)",
                         ScanDurationMs = sw.ElapsedMilliseconds
                     };

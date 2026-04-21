@@ -1,10 +1,16 @@
 # secure-file-upload-dotnet
 
-**Production-grade, defense-in-depth file upload security for ASP.NET Core 8+**
+**Defense-in-depth file upload pipeline for ASP.NET Core 8+**
 
-This repository contains a complete C# file upload security pipeline derived from a production ASP.NET Core 8 application. The code has been de-branded and generalized for community use.
+[![NuGet](https://img.shields.io/nuget/v/SecureFileUpload.Core.svg)](https://www.nuget.org/packages/SecureFileUpload.Core)
+[![Build](https://github.com/systemslibrarian/secure-file-upload-dotnet/actions/workflows/nuget-publish.yml/badge.svg)](https://github.com/systemslibrarian/secure-file-upload-dotnet/actions/workflows/nuget-publish.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 
-The companion `SECURITY-ANALYSIS.md` documents a structured adversarial AI red-team review of this exact code, including real findings, honest gaps, and recommendations.
+An 8-layer file upload validation and storage pipeline derived from a production ASP.NET Core 8 document-intake workflow. The code has been de-branded, generalized, and published for reuse — it is the same pipeline structure used in production, not a toy example.
+
+The goal of this repo is to show what a *measured, fail-closed* upload pipeline looks like in real C#: every claim below is backed by code in [`src/`](src), and every known limitation is documented in [`KNOWN-GAPS.md`](KNOWN-GAPS.md).
+
+[`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) records a structured adversarial AI red-team review of this exact code — original findings, current resolution status, and the residual gaps that remain.
 
 > *"So whether you eat or drink or whatever you do, do it all for the glory of God."*
 > — 1 Corinthians 10:31
@@ -31,7 +37,7 @@ This codebase addresses all of them, and the red-team analysis tells you where i
 
 ## The 8-Layer Validation Pipeline
 
-Every uploaded file passes through all layers in order. **Failure at any layer rejects the file immediately.** The pipeline is fail-closed: unknown types are rejected, not passed.
+Every uploaded file passes through all layers in order. **Failure at any validation layer rejects the file immediately.** The pipeline is fail-closed on every *content* decision — unknown types, malformed files, and validation exceptions all result in rejection. The single deliberate exception is virus-scanner *availability* (Layer 7), which is fail-open by design and explicitly tracked; see [Key Design Decisions](#key-design-decisions-and-why) below.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -75,8 +81,10 @@ Every uploaded file passes through all layers in order. **Failure at any layer r
           ┌───────────────▼────────────────┐
           │  Layer 7: Virus Scan            │  Windows Defender (Windows) OR
           │  (IVirusScanService)            │  ClamAV via clamd zINSTREAM (Linux/cross-platform).
-          │                                 │  Fail-closed on scanner error.
-          │                                 │  Only runs when VirusScan:Enabled=true
+          │                                 │  Fail-closed on signature hit (infected → reject).
+          │                                 │  Fail-open on scanner availability (timeout/down →
+          │                                 │  accept as NotScanned; tracked in result, never
+          │                                 │  silently "clean"). Only runs when VirusScan:Enabled=true.
           └───────────────┬────────────────┘
                           │
           ┌───────────────▼────────────────┐
@@ -106,8 +114,10 @@ Every uploaded file passes through all layers in order. **Failure at any layer r
 
 ## Key Design Decisions (and Why)
 
-### Fail-Closed Throughout
-Unknown file types, unavailable scanners, exceptions in validation — all result in rejection. The default is **deny**, not allow. This is the single most important design decision in the entire codebase.
+### Fail-Closed on Content Decisions
+Unknown file types, malformed structures, deep-validation exceptions, missing or placeholder encryption secrets, and storage paths inside `wwwroot` all result in rejection or refusal to start. The default for any *content* decision is **deny**, not allow.
+
+The one deliberate exception is **virus-scanner availability** (Layer 7). A scanner that returns *infected* always rejects the file. A scanner that is unreachable, times out, or throws is treated as **fail-open with explicit `NotScanned` tracking** — the file is accepted only because Layers 1–6 have already cleared it, and the outcome is surfaced in `FileUploadResult.ScanNotScannedCount` and logged as `VIRUS_SCAN_OPERATIONAL_FAILURE`. This is documented in [`KNOWN-GAPS.md`](KNOWN-GAPS.md) and is the right trade-off for a patron-document workflow where a `clamd` outage must not block legitimate registrations; deployments that need scanner-availability to be hard-blocking should switch to a queued-scan model (see [`docs/hardening-roadmap.md`](docs/hardening-roadmap.md) §1.3).
 
 ### Signature-First Classification (FileContentValidator)
 The deep validator detects the *actual* file type from magic bytes before dispatching to the format-specific validator. A file claiming to be `.jpg` that opens with `%PDF` gets caught as a type mismatch before any format-specific logic runs.
@@ -146,7 +156,7 @@ Every attacker-controlled filename is run through `SanitizeForLog` before being 
 - **`WindowsDefenderScanService`** — invokes `MpCmdRun.exe`; requires Windows.
 - **`ClamAvScanService`** — talks to `clamd` directly over TCP using the documented `zINSTREAM` protocol. No temp file is written. Cross-platform (Linux, macOS, containers).
 
-Both are fail-closed: any scanner exception or error response causes the upload to be marked NotScanned (file already passed Layers 1–6, never silently "clean").
+Detection is fail-closed: any clear malware signature rejects the upload. Operational failures (timeout, daemon down, unparseable response) are fail-open with explicit `NotScanned` tracking — the file is accepted only because it already passed Layers 1–6, and the outcome is counted in `FileUploadResult.ScanNotScannedCount` and emitted as a `VIRUS_SCAN_OPERATIONAL_FAILURE` log event. The result is **never silently relabelled as "clean"**.
 
 ### Hardened Download Surface (`SecureFileDownloadController`)
 Serving decrypted patron documents safely is a separate problem from accepting them safely. The reference download controller:
@@ -225,15 +235,50 @@ Path traversal checks use a proper base-path check rather than `string.StartsWit
 
 ## Dependencies
 
-- .NET 8+
-- [SixLabors.ImageSharp](https://github.com/SixLabors/ImageSharp) — used in `FileContentValidator` for `Image.Identify()` (structural validation without full pixel decode) and in `FileUploadService` for image recompression
-- One of:
-  - **Windows Defender** (`MpCmdRun.exe`) — used by `WindowsDefenderScanService` on Windows
-  - **ClamAV** (`clamd` listening on TCP) — used by `ClamAvScanService` on Linux / macOS / containers
+The NuGet package declares these dependencies — no manual installation needed:
+
+- **ASP.NET Core 8+** shared framework (via `FrameworkReference`)
+- **[SixLabors.ImageSharp 3.1.x](https://github.com/SixLabors/ImageSharp)** — image structural validation and polyglot-tail recompression
+
+At runtime, one scanner backend is also required (not a NuGet package):
+- **Windows Defender** (`MpCmdRun.exe`) — Windows only, used by `WindowsDefenderScanService`
+- **ClamAV** (`clamd` listening on TCP) — Linux/macOS/containers, used by `ClamAvScanService`
+
+The scanner is selected automatically by `AddSecureFileUpload()` based on `OperatingSystem.IsWindows()`. Virus scanning can be disabled entirely via `VirusScan:Enabled: false` in appsettings (other 7 layers still run).
+
+---
+
+## Installation
+
+```bash
+dotnet add package SecureFileUpload.Core
+```
+
+Requires .NET 8+ with ASP.NET Core. The package targets `net8.0` and depends on the ASP.NET Core shared framework, which ships with every ASP.NET Core 8+ runtime — nothing extra needs to be installed.
 
 ---
 
 ## Integration Pattern
+
+### Minimal registration (recommended)
+
+```csharp
+// Program.cs
+using SecureFileUpload.Services;
+
+// Registers FileContentValidator, the platform-appropriate IVirusScanService,
+// and IFileUploadService in one call. Scanner options are read from appsettings
+// ("FileContent" section). Pass a lambda to override in code.
+builder.Services.AddSecureFileUpload();
+
+// Size limit must match FileUpload:MaxTotalUploadBytes in appsettings.
+builder.Services.Configure<FormOptions>(options =>
+{
+    options.MultipartBodyLengthLimit = 53_477_376; // 51 MB — adjust to match your config
+});
+```
+
+### Manual registration (if you need full control)
 
 ```csharp
 // Program.cs / Startup registration
@@ -254,8 +299,9 @@ builder.Services.Configure<FormOptions>(options =>
 });
 ```
 
+### Controller usage
+
 ```csharp
-// Controller usage
 [HttpPost]
 [RequestSizeLimit(53_477_376)]
 public async Task<IActionResult> Submit(MyInputModel model)
@@ -286,6 +332,8 @@ public async Task<IActionResult> Submit(MyInputModel model)
 - [`docs/hardening-roadmap.md`](docs/hardening-roadmap.md) — Recommendations to reach the strongest realistic posture
 - [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) — AI red-team adversarial findings (with current resolution status)
 - [`KNOWN-GAPS.md`](KNOWN-GAPS.md) — Honest limitations and what this does NOT protect against
+- [`tests/attack-vectors.md`](tests/attack-vectors.md) — Per-layer attack test cases (manual + automation guide)
+- [`tests/Fuzz/`](tests/Fuzz) — SharpFuzz + AFL++ harness for the deep content validator
 
 ---
 

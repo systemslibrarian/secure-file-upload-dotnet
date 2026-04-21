@@ -17,30 +17,20 @@
   </PropertyGroup>
 
   <!--
-    FileContentValidator depends on IFormFile (Microsoft.AspNetCore.Http) and
-    is hosted inside an ASP.NET Core app, so we pull in the ASP.NET Core
-    shared framework. Without this reference IFormFile / FormFile do not
-    resolve and the harness will not build.
+    ASP.NET Core is pulled in transitively via SecureFileUpload.Core.
+    Only SharpFuzz needs explicit listing here.
   -->
   <ItemGroup>
-    <FrameworkReference Include="Microsoft.AspNetCore.App" />
-  </ItemGroup>
-
-  <ItemGroup>
     <PackageReference Include="SharpFuzz" Version="2.1.1" />
-    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Options" Version="8.0.0" />
   </ItemGroup>
 
   <!--
-    The deep validator is distributed as loose source files in /src, so we
-    pull it in directly via <Compile Include>. Replace with a
-    <ProjectReference> if you move the validator into a class library.
-    Forward slashes work cross-platform; MSBuild normalises separators.
+    Reference the class library project instead of including the source file
+    directly. This ensures the fuzz harness always compiles against the same
+    binary as would be shipped in the NuGet package.
   -->
   <ItemGroup>
-    <Compile Include="../../src/FileContentValidator.cs" Link="FileContentValidator.cs" />
+    <ProjectReference Include="../../src/SecureFileUpload.Core.csproj" />
   </ItemGroup>
 
 </Project>

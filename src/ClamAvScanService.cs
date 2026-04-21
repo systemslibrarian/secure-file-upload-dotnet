@@ -32,9 +32,14 @@ namespace SecureFileUpload.Services
     ///   MaxStreamBytes       (default 26214400 == 25 MiB; must match clamd's
     ///                         StreamMaxLength setting in clamd.conf)
     ///
-    /// Fail-closed: any I/O error, timeout, or daemon unavailability returns
-    /// IsClean=false, ScanSuccessful=false so the upload pipeline rejects the
-    /// file rather than silently letting it through.
+    /// Detection fail-closed: a clean/infected verdict from clamd is always honoured —
+    /// infected → pipeline rejects.
+    /// Availability fail-open: if clamd is unreachable, times out, or returns an
+    /// unrecognised response, this service sets ScanSuccessful=false. The calling
+    /// pipeline (FileUploadService.RunVirusScanAsync) then accepts the file as
+    /// NotScanned — counted in FileUploadResult.ScanNotScannedCount and logged as
+    /// VIRUS_SCAN_OPERATIONAL_FAILURE, never silently relabelled as clean.
+    /// See KNOWN-GAPS.md §Gap 9 for the architectural rationale.
     /// </summary>
     public class ClamAvScanService : IVirusScanService
     {

@@ -1,0 +1,84 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SecureFileUpload</RootNamespace>
+    <AssemblyName>SecureFileUpload.Core</AssemblyName>
+
+    <!-- ── NuGet package metadata ─────────────────────────────────────── -->
+    <PackageId>SecureFileUpload.Core</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>systemslibrarian</Authors>
+    <Description>
+      Production-grade, defense-in-depth file upload pipeline for ASP.NET Core 8+.
+
+      Provides an 8-layer validation and encrypted-storage pipeline:
+        Layer 1  File size limits (per-file and batch)
+        Layer 2  Extension allowlist (.jpg .jpeg .png .webp .pdf)
+        Layer 3  MIME type ↔ extension cross-validation
+        Layer 4  Magic-byte / file-signature verification
+        Layer 5  Filename inspection (double-extension, Unicode tricks, path traversal)
+        Layer 6  Deep content validation — JPEG/PNG/WebP structural walkers, PDF
+                 pattern scan including FlateDecode-compressed stream inspection
+        Layer 7  Virus scanning via Windows Defender or ClamAV (pluggable IVirusScanService)
+        Layer 8  AES-256-GCM envelope-encrypted storage outside wwwroot,
+                 image recompression to strip polyglot tails
+
+      Includes a reference hardened download controller and a SharpFuzz/AFL++ harness
+      for the deep content validator.
+    </Description>
+    <PackageTags>aspnetcore;security;file-upload;antivirus;clamav;encryption;aes-gcm;validation</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/systemslibrarian/secure-file-upload-dotnet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/systemslibrarian/secure-file-upload-dotnet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+
+    <!-- Include source-link and deterministic build for NuGet provenance -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+    <!-- Produce XML doc so IntelliSense works for package consumers -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Suppress "missing XML doc" warnings for members that aren't yet documented -->
+    <NoWarn>1591</NoWarn>
+  </PropertyGroup>
+
+  <!-- ── Runtime dependencies ─────────────────────────────────────────── -->
+  <!--
+    Microsoft.AspNetCore.App ships as a shared framework on the target machine —
+    referencing it here means it will NOT be bundled inside the package.
+    Consumers must target net8.0 or later with ASP.NET Core present.
+  -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Image identification + recompression (polyglot-tail mitigation) -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
+
+    <!-- Source Link: maps debug symbols back to the GitHub source tree -->
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <!-- ── Source file layout ────────────────────────────────────────────── -->
+  <!--
+    All source lives directly in src/ alongside this project file.
+    ReplacementCardInputModel.cs is an application-level sample — excluded
+    from the library so it doesn't pollute the package API surface.
+  -->
+  <ItemGroup>
+    <Compile Remove="ReplacementCardInputModel.cs" />
+  </ItemGroup>
+
+  <!-- ── Pack: include README at the root of the NuGet package ─────────── -->
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

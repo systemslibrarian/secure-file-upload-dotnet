@@ -1,0 +1,3 @@
+# Placeholder so the seeds/ directory exists in the repo.
+# Populate this directory per the corpus guidance in tests/Fuzz/README.md
+# before invoking afl-fuzz. AFL refuses to start with an empty seed directory.

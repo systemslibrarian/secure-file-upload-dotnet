@@ -29,11 +29,9 @@ Anything in those four categories is a real bug.
 tests/Fuzz/
 ├── FuzzHarness.csproj      ← console exe wired to SharpFuzz
 ├── Program.cs              ← entry point: feeds AFL one file at a time
-├── seeds/                  ← starter corpus (real JPEGs, PNGs, WebPs, PDFs)
-│   ├── valid-photo.jpg
-│   ├── valid-doc.pdf
-│   ├── eicar-in-jpg.jpg
-│   └── …
+├── seeds/                  ← starter corpus (you provide — see "Seed corpus
+│                              guidance" below). Tracked as an empty directory
+│                              via `.gitkeep`; AFL refuses to start with no seeds.
 └── README.md               ← (this file)
 ```
 

@@ -1,0 +1,119 @@
+name: Build, Test & Publish NuGet
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'   # triggers publish on v1.0.0, v1.2.3-beta.1, etc.
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Build + verify the library compiles cleanly ───────────────────────
+  build:
+    name: Build & Pack
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history required for Source Link
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore src/SecureFileUpload.Core.csproj
+
+      - name: Build (Release)
+        run: dotnet build src/SecureFileUpload.Core.csproj --configuration Release --no-restore
+
+      - name: Pack
+        run: >
+          dotnet pack src/SecureFileUpload.Core.csproj
+          --configuration Release
+          --no-build
+          --output nupkgs
+        # Version is read from the <Version> property in the .csproj.
+        # Override on the CLI when tagging a release:
+        #   dotnet pack … /p:Version=1.2.3
+
+      - name: Upload NuGet artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkgs
+          path: nupkgs/*.nupkg
+          if-no-files-found: error
+
+      - name: Upload symbol packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: snupkgs
+          path: nupkgs/*.snupkg
+          if-no-files-found: warn   # .snupkg is optional if symbols aren't embedded
+
+  # ── Verify the fuzz harness builds against the library ────────────────
+  fuzz-build:
+    name: Build Fuzz Harness
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore tests/Fuzz/FuzzHarness.csproj
+
+      - name: Build
+        run: dotnet build tests/Fuzz/FuzzHarness.csproj --configuration Release --no-restore
+
+  # ── Publish to NuGet.org — only on version tags ───────────────────────
+  publish:
+    name: Publish to NuGet.org
+    runs-on: ubuntu-latest
+    needs: [build, fuzz-build]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: read
+
+    environment:
+      name: nuget-publish
+      # The URL shown on the environment after a successful publish.
+      url: https://www.nuget.org/packages/SecureFileUpload.Core
+
+    steps:
+      - name: Download NuGet artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: nupkgs
+          path: nupkgs
+
+      - name: Download symbol packages
+        uses: actions/download-artifact@v4
+        with:
+          name: snupkgs
+          path: nupkgs
+        continue-on-error: true   # symbol upload is non-fatal
+
+      - name: Push to NuGet.org
+        run: >
+          dotnet nuget push nupkgs/*.nupkg
+          --api-key ${{ secrets.NUGET_API_KEY }}
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
+        # NUGET_API_KEY must be set in the repository's
+        # Settings → Secrets → Actions → New repository secret.
+        # Scope the key to this package only in your NuGet.org account.
