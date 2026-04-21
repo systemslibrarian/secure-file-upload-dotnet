@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Secure File Upload Pipeline — Interactive Demo</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh;line-height:1.6}
+
+/* ── Header ── */
+header{border-bottom:1px solid #30363d;padding:1.25rem 2rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
+.logo{font-size:1.75rem;line-height:1}
+.header-text h1{font-size:1.125rem;font-weight:700;color:#e6edf3}
+.header-text p{font-size:.8rem;color:#8b949e}
+.gh-link{margin-left:auto;display:flex;align-items:center;gap:.375rem;color:#8b949e;text-decoration:none;font-size:.8125rem;padding:.3rem .75rem;border:1px solid #30363d;border-radius:6px;white-space:nowrap;transition:all .15s}
+.gh-link:hover{border-color:#8b949e;color:#e6edf3}
+
+/* ── Layout ── */
+main{max-width:1240px;margin:0 auto;padding:1.5rem 2rem;display:grid;grid-template-columns:360px 1fr;gap:1.5rem}
+@media(max-width:860px){main{grid-template-columns:1fr;padding:1rem}}
+
+/* ── Panel ── */
+.panel{background:#161b22;border:1px solid #30363d;border-radius:12px;overflow:hidden}
+.panel-header{padding:.75rem 1.25rem;border-bottom:1px solid #30363d;font-size:.75rem;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;display:flex;align-items:center;gap:.5rem}
+
+/* ── Upload zone ── */
+.upload-zone{margin:1.25rem;border:2px dashed #30363d;border-radius:8px;padding:1.75rem 1rem;text-align:center;cursor:pointer;transition:all .2s}
+.upload-zone:hover,.upload-zone.dragging{border-color:#58a6ff;background:rgba(88,166,255,.05)}
+.upload-icon{font-size:1.75rem;margin-bottom:.5rem}
+.upload-zone p{color:#8b949e;font-size:.8125rem;margin-bottom:.75rem}
+.upload-btn{background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:.35rem .875rem;border-radius:6px;font-size:.8125rem;cursor:pointer;transition:border-color .15s}
+.upload-btn:hover{border-color:#8b949e}
+
+/* ── Attack buttons ── */
+.attacks{padding:0 1.25rem 1.25rem}
+.attacks-label{font-size:.72rem;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin:1rem 0 .625rem;display:flex;align-items:center;gap:.375rem}
+.attack-grid{display:grid;grid-template-columns:1fr 1fr;gap:.4rem}
+.attack-btn{background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:.45rem .625rem;border-radius:6px;font-size:.73rem;cursor:pointer;text-align:left;transition:all .15s;display:flex;align-items:center;gap:.3rem;line-height:1.3}
+.attack-btn:hover{border-color:#8b949e;background:#292e36}
+.attack-btn.is-clean{border-color:#238636}
+.attack-btn.is-clean:hover{background:rgba(35,134,54,.1)}
+.layer-badge{margin-left:auto;font-size:.6rem;padding:.1rem .35rem;border-radius:3px;font-weight:700;flex-shrink:0}
+.badge-fail{background:rgba(248,81,73,.15);color:#f85149}
+.badge-pass{background:rgba(35,134,54,.15);color:#3fb950}
+
+/* ── Info card ── */
+.info-card{margin:0 1.25rem 1.25rem;padding:.875rem 1rem;background:#0d1117;border:1px solid #30363d;border-radius:8px;font-size:.775rem;color:#8b949e;line-height:1.65}
+.info-card strong{color:#e6edf3;display:block;margin-bottom:.25rem}
+.info-card code{background:#21262d;padding:.1rem .3rem;border-radius:3px;font-size:.72rem;font-family:'SF Mono','Fira Code',monospace}
+.info-card a{color:#58a6ff;text-decoration:none}
+.info-card a:hover{text-decoration:underline}
+
+/* ── Pipeline ── */
+.idle-hint{padding:3.5rem 1rem;text-align:center;color:#8b949e}
+.idle-hint .idle-icon{font-size:2.25rem;margin-bottom:.75rem}
+.idle-hint p{font-size:.875rem;line-height:1.7}
+.file-info-bar{display:none;margin:1rem 1.25rem 0;padding:.5rem .875rem;background:#21262d;border-radius:6px;font-size:.775rem;color:#8b949e;display:none;align-items:center;gap:.5rem;flex-wrap:wrap}
+.file-info-bar.show{display:flex}
+.file-info-bar strong{color:#e6edf3}
+.file-info-bar .dot{color:#484f58}
+.pipeline{padding:.875rem 1.25rem 1.25rem;display:flex;flex-direction:column;gap:.4rem}
+
+/* ── Layer card ── */
+.layer{border:1px solid #30363d;border-radius:8px;padding:.7rem .875rem;transition:border-color .25s,background .25s;position:relative;overflow:hidden}
+.layer::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:2px 0 0 2px;transition:background .25s}
+.layer.pending::before{background:#30363d}
+.layer.scanning::before{background:#d29922}
+.layer.passed::before{background:#238636}
+.layer.rejected::before{background:#da3633}
+.layer.simulated::before{background:#8b949e}
+.layer.skipped::before{background:#30363d}
+.layer.scanning{border-color:#6e5317;background:rgba(210,153,34,.04)}
+.layer.passed{border-color:#1a4d27;background:rgba(35,134,54,.04)}
+.layer.rejected{border-color:#6e2020;background:rgba(218,54,51,.05)}
+.layer.simulated{opacity:.75}
+.layer.skipped{opacity:.45}
+
+.layer-header{display:flex;align-items:center;gap:.6rem}
+.layer-num{width:1.375rem;height:1.375rem;border-radius:50%;background:#21262d;border:1px solid #30363d;display:flex;align-items:center;justify-content:center;font-size:.625rem;font-weight:700;color:#8b949e;flex-shrink:0;transition:all .25s;font-variant-numeric:tabular-nums}
+.layer.scanning .layer-num{border-color:#d29922;color:#d29922;animation:numPulse 1s ease-in-out infinite}
+.layer.passed .layer-num{border-color:#238636;color:#3fb950;background:rgba(35,134,54,.2)}
+.layer.rejected .layer-num{border-color:#da3633;color:#f85149;background:rgba(218,54,51,.2)}
+.layer.simulated .layer-num{border-color:#6e7681;color:#8b949e}
+@keyframes numPulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+.layer-title{font-size:.8125rem;font-weight:600;color:#e6edf3;flex:1}
+.layer-icon{font-size:.9rem;min-width:1.125rem;text-align:center;transition:all .2s}
+
+.layer-desc{font-size:.7rem;color:#6e7681;margin:.2rem 0 0 2rem}
+.layer-note{font-size:.67rem;color:#6e5317;margin:.15rem 0 0 2rem;font-style:italic}
+.layer-result{display:none;font-size:.7rem;margin:.35rem 0 0 2rem;padding:.3rem .5rem;border-radius:4px;font-family:'SF Mono','Fira Code','Cascadia Code',monospace;line-height:1.5;word-break:break-word}
+.layer.passed .layer-result{display:block;background:rgba(35,134,54,.08);color:#3fb950}
+.layer.rejected .layer-result{display:block;background:rgba(218,54,51,.08);color:#f85149}
+.layer.scanning .layer-result{display:block;background:rgba(210,153,34,.08);color:#d29922}
+.layer.simulated .layer-result{display:block;background:rgba(139,148,158,.08);color:#8b949e}
+.layer.skipped .layer-result{display:block;background:transparent;color:#484f58}
+
+/* ── Result banner ── */
+.result-banner{display:none;margin:1rem 1.25rem 0;padding:.875rem 1rem;border-radius:8px;text-align:center}
+.result-banner.show{display:block}
+.result-banner.success{background:rgba(35,134,54,.12);border:1px solid #238636;color:#3fb950}
+.result-banner.failure{background:rgba(218,54,51,.12);border:1px solid #da3633;color:#f85149}
+.result-banner h2{font-size:1rem;margin-bottom:.2rem}
+.result-banner p{font-size:.775rem;opacity:.85}
+
+/* ── Footer ── */
+footer{text-align:center;padding:1.5rem 2rem;color:#484f58;font-size:.775rem;border-top:1px solid #21262d;margin-top:1.5rem}
+footer a{color:#58a6ff;text-decoration:none}
+footer a:hover{text-decoration:underline}
+
+/* ── Responsive tweaks ── */
+@media(max-width:500px){.attack-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">🛡️</div>
+  <div class="header-text">
+    <h1>Secure File Upload Pipeline</h1>
+    <p>8-layer defense-in-depth validation — interactive browser demo</p>
+  </div>
+  <a class="gh-link" href="https://github.com/systemslibrarian/secure-file-upload-dotnet" target="_blank" rel="noopener">
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+    View Source
+  </a>
+</header>
+
+<main>
+  <!-- Left column -->
+  <div>
+    <div class="panel">
+      <div class="panel-header">📁 Upload a File</div>
+      <div class="upload-zone" id="dropZone">
+        <div class="upload-icon">📄</div>
+        <p>Drop a file here, or click to browse<br><span style="font-size:.7rem">(.jpg .jpeg .png .webp .pdf — or try something malicious)</span></p>
+        <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Choose file…</button>
+        <input type="file" id="fileInput" style="display:none">
+      </div>
+
+      <div class="attacks">
+        <div class="attacks-label">⚡ Quick attack tests</div>
+        <div class="attack-grid">
+          <button class="attack-btn is-clean" onclick="runTest('clean')">
+            ✅ Clean JPEG
+            <span class="layer-badge badge-pass">ALL PASS</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('oversized')">
+            📦 11 MB file
+            <span class="layer-badge badge-fail">L1</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('wrong_ext')">
+            🔀 .exe extension
+            <span class="layer-badge badge-fail">L2</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('mime_mismatch')">
+            🎭 PDF ext / JPEG MIME
+            <span class="layer-badge badge-fail">L3</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('exe_jpg')">
+            💣 EXE renamed .jpg
+            <span class="layer-badge badge-fail">L4</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('zip_jpg')">
+            🗜 ZIP renamed .jpg
+            <span class="layer-badge badge-fail">L4</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('double_ext')">
+            🪤 photo.php.jpg
+            <span class="layer-badge badge-fail">L5</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('path_traversal')">
+            🗂 ../passwd.jpg
+            <span class="layer-badge badge-fail">L5</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('rlo')">
+            🔄 RLO Unicode trick
+            <span class="layer-badge badge-fail">L5</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('webp_avi')">
+            📼 AVI renamed .webp
+            <span class="layer-badge badge-fail">L4</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('pdf_js')">
+            📜 PDF + /JavaScript
+            <span class="layer-badge badge-fail">L6</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('php_shell')">
+            🐚 JPEG + PHP shell
+            <span class="layer-badge badge-fail">L6</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('embedded_exe')">
+            🪱 JPEG + PE header
+            <span class="layer-badge badge-fail">L6</span>
+          </button>
+          <button class="attack-btn" onclick="runTest('encrypted_pdf')">
+            🔒 Encrypted PDF
+            <span class="layer-badge badge-fail">L6</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="info-card" style="margin-top:1rem">
+      <strong>About this demo</strong>
+      This is a client-side JavaScript simulation of the 8-layer ASP.NET Core 8 validation pipeline.
+      Layers 1–6 are fully implemented in the browser. Layer 7 (Windows Defender) and
+      Layer 8 (AES-256-GCM storage) are structurally simulated — no scanner or disk write occurs.
+      <br><br>
+      Source: <a href="https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/src/FileUploadService.cs" target="_blank" rel="noopener">FileUploadService.cs</a>
+      &nbsp;·&nbsp;
+      <a href="https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/src/FileContentValidator.cs" target="_blank" rel="noopener">FileContentValidator.cs</a>
+      <br>
+      <a href="https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/KNOWN-GAPS.md" target="_blank" rel="noopener">Read KNOWN-GAPS.md →</a>
+    </div>
+  </div>
+
+  <!-- Right column: pipeline -->
+  <div>
+    <div class="panel">
+      <div class="panel-header">🔍 Validation Pipeline</div>
+
+      <div id="fileInfoBar" class="file-info-bar">
+        Testing: <strong id="infoName"></strong>
+        <span class="dot">·</span><span id="infoSize"></span>
+        <span class="dot">·</span><span id="infoMime"></span>
+      </div>
+
+      <div id="resultBanner" class="result-banner"></div>
+
+      <div id="idleState" class="idle-hint">
+        <div class="idle-icon">🛡️</div>
+        <p>Upload a file or click an attack test<br>to watch the pipeline run in real time.</p>
+      </div>
+
+      <div class="pipeline" id="pipeline" style="display:none"></div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <a href="https://github.com/systemslibrarian/secure-file-upload-dotnet" target="_blank" rel="noopener">secure-file-upload-dotnet</a>
+  &nbsp;·&nbsp; Production-grade file upload security for ASP.NET Core 8+
+  &nbsp;·&nbsp; MIT License
+</footer>
+
+<script>
+'use strict';
+
+// ── Layer definitions ─────────────────────────────────────────────────────────
+
+const LAYER_DEFS = [
+  { id:1, name:'File Size Check',             desc:'Per-file max (10 MB) + total batch limit. Rejects before any buffering — no bytes enter memory.' },
+  { id:2, name:'Extension Allowlist',         desc:'Strict allowlist: .jpg .jpeg .png .webp .pdf only. Everything else is rejected by default.' },
+  { id:3, name:'MIME / Extension Cross-Check',desc:'Browser-reported MIME must match the claimed extension. Catches extension-spoofed uploads.' },
+  { id:4, name:'Magic Bytes (File Signature)',desc:'First bytes of file content must match the expected format — independent of filename and MIME header.' },
+  { id:5, name:'Filename Inspection',         desc:'Double-extension (.php.jpg), path traversal (../), Unicode RLO tricks, null bytes, Windows reserved names.' },
+  { id:6, name:'Deep Content Validation',     desc:'Format-specific structural walk: JPEG segments, PNG chunks, PDF object scan, embedded executable detection.' },
+  { id:7, name:'Virus Scan',                  desc:'Windows Defender (MpCmdRun.exe) or ClamAV. Fail-closed: scanner unavailable = file rejected.',
+    note:'Simulated — no AV scanner available in browser.' },
+  { id:8, name:'Encrypted Storage',           desc:'AES-256-GCM authenticated encryption, randomized filename, path outside wwwroot, pre-write traversal check.',
+    note:'Simulated — no disk write in browser demo.' },
+];
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const MAX_FILE_BYTES   = 10 * 1024 * 1024; // 10 MB
+const MAX_DEEP_SCAN    = 5  * 1024 * 1024; // 5 MB read limit for Layer 6
+
+const ALLOWED_EXTS  = new Set(['.jpg','.jpeg','.png','.webp','.pdf']);
+const ALLOWED_MIMES = new Set(['image/jpeg','image/jpg','image/png','image/webp','application/pdf']);
+
+const EXT_MIME_MAP = {
+  '.jpg':  new Set(['image/jpeg','image/jpg']),
+  '.jpeg': new Set(['image/jpeg','image/jpg']),
+  '.png':  new Set(['image/png']),
+  '.webp': new Set(['image/webp']),
+  '.pdf':  new Set(['application/pdf']),
+};
+
+const MIN_SIZES = { '.jpg':4, '.jpeg':4, '.png':16, '.webp':12, '.pdf':5 };
+
+// Magic byte signatures per extension
+const FILE_SIGS = {
+  '.jpg':  [[0xFF,0xD8,0xFF]],
+  '.jpeg': [[0xFF,0xD8,0xFF]],
+  '.png':  [[0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]],
+  '.webp': [[0x52,0x49,0x46,0x46]], // RIFF — WEBP fourCC at offset 8 checked separately
+  '.pdf':  [[0x25,0x50,0x44,0x46]], // %PDF
+};
+
+// Known dangerous magic bytes (for identification in rejection message)
+const DANGEROUS_SIGS = [
+  { sig:[0x4D,0x5A],                       name:'Windows PE Executable (MZ)' },
+  { sig:[0x50,0x4B,0x03,0x04],             name:'ZIP archive' },
+  { sig:[0x7F,0x45,0x4C,0x46],             name:'ELF Linux executable' },
+  { sig:[0xCA,0xFE,0xBA,0xBE],             name:'Java class / Mach-O binary' },
+  { sig:[0xD0,0xCF,0x11,0xE0],             name:'OLE compound document (Office macro)' },
+  { sig:[0x1F,0x8B,0x08],                  name:'GZIP archive' },
+  { sig:[0x37,0x7A,0xBC,0xAF,0x27,0x1C],  name:'7-Zip archive' },
+  { sig:[0x52,0x61,0x72,0x21,0x1A,0x07],  name:'RAR archive' },
+];
+
+// Double-extension blocklist
+const DANGEROUS_EXTS = new Set([
+  '.exe','.dll','.bat','.cmd','.ps1','.psm1','.vbs','.vbe','.js','.jse',
+  '.jar','.msi','.scr','.com','.pif','.hta',
+  '.php','.php3','.php4','.php5','.php7','.phtml','.phar',
+  '.asp','.aspx','.asax','.ascx','.asmx','.cshtml',
+  '.jsp','.jspx','.cgi','.pl','.py','.rb',
+  '.sh','.bash','.zsh','.fish',
+  '.svg','.html','.htm','.xhtml','.shtml','.swf','.lnk','.reg',
+]);
+
+// Windows reserved device names
+const WIN_RESERVED = new Set([
+  'CON','PRN','AUX','NUL',
+  'COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9',
+  'LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9',
+]);
+
+// Dangerous PDF patterns (Layer 6)
+const PDF_DANGEROUS = [
+  '/JS ','/JS\r','/JS\n','/JavaScript','/Launch',
+  '/EmbeddedFile','/RichMedia','/XFA','/JBIG2Decode','/3D',
+];
+
+// Characters that block OpenAction when JS is present
+const PDF_TRIGGER_ACTIONS = ['/OpenAction','/AA '];
+
+// Shell/code injection patterns
+const SHELL_PATTERNS = [
+  '<?php','<?=','<? ',
+  'passthru(','system(','exec(','shell_exec(',
+  'popen(','proc_open(','eval(',
+  '#!/bin/sh','#!/bin/bash','#!/usr/bin/perl','#!/usr/bin/python',
+  'cmd.exe','cmd /c','powershell',
+  'import os','import subprocess',
+];
+
+// Executable signatures to find embedded in images (scanned from offset 16+)
+const EMBED_EXE_SIGS = [
+  { sig:[0x4D,0x5A],             name:'PE executable (MZ)', validatePE:true },
+  { sig:[0x7F,0x45,0x4C,0x46],  name:'ELF executable' },
+  { sig:[0xCA,0xFE,0xBA,0xBE],  name:'Java class / Mach-O' },
+];
+
+// ── Layer validators ──────────────────────────────────────────────────────────
+
+function layer1_size(file) {
+  const ext = getExt(file.name);
+  const min = MIN_SIZES[ext] || 1;
+  if (file.size === 0)         return fail('File is empty.');
+  if (file.size < min)         return fail(`File too small for ${ext.toUpperCase()} — minimum ${min} bytes required.`);
+  if (file.size > MAX_FILE_BYTES)
+    return fail(`${fmtBytes(file.size)} — exceeds the 10 MB per-file limit.`);
+  return pass(`${fmtBytes(file.size)} — within size limits.`);
+}
+
+function layer2_extension(file) {
+  const ext = getExt(file.name);
+  if (!ext)                       return fail('File has no extension.');
+  if (!ALLOWED_EXTS.has(ext))     return fail(`Extension "${ext}" is not in the allowlist (.jpg .jpeg .png .webp .pdf).`);
+  return pass(`Extension "${ext}" is in the allowlist.`);
+}
+
+function layer3_mime(file) {
+  const ext = getExt(file.name);
+  const mime = file.type || '';
+  if (!ALLOWED_MIMES.has(mime))
+    return fail(`MIME type "${mime || '(none)'}" is not permitted.`);
+  const validMimes = EXT_MIME_MAP[ext];
+  if (validMimes && !validMimes.has(mime))
+    return fail(`MIME "${mime}" does not match extension "${ext}" — expected ${[...validMimes].join(' or ')}.`);
+  return pass(`MIME "${mime}" is consistent with "${ext}".`);
+}
+
+async function layer4_magic(file) {
+  const ext   = getExt(file.name);
+  const sigs  = FILE_SIGS[ext];
+  if (!sigs) return fail('No magic byte signature defined — fail closed.');
+
+  const header = await readBytes(file, 12);
+  const hexStr = toHex(header, 8);
+
+  for (const sig of sigs) {
+    if (matchesAt(header, sig, 0)) {
+      // WebP must also have WEBP fourCC at offset 8
+      if (ext === '.webp') {
+        if (header.length < 12 ||
+            header[8] !== 0x57 || header[9] !== 0x45 ||
+            header[10] !== 0x42 || header[11] !== 0x50) {
+          return fail(`RIFF container present but missing WEBP fourCC at offset 8 — likely AVI or WAV in disguise. Header: ${hexStr}`);
+        }
+      }
+      return pass(`Signature verified: ${hexStr}`);
+    }
+  }
+
+  // Try to identify what the file actually is
+  for (const ds of DANGEROUS_SIGS) {
+    if (matchesAt(header, ds.sig, 0)) {
+      return fail(`Content is "${ds.name}" — not a ${ext.slice(1).toUpperCase()}. Possible disguised upload. Header: ${hexStr}`);
+    }
+  }
+  return fail(`Magic bytes do not match any allowed signature for "${ext}". Header: ${hexStr}`);
+}
+
+function layer5_filename(file) {
+  const name = file.name;
+  if (!name || !name.trim()) return fail('Empty filename.');
+  if (name.includes('..'))    return fail('Path traversal sequence ".." detected — possible directory escape attack.');
+  if (name.includes('/') || name.includes('\\')) return fail('Path separator in filename — possible path traversal.');
+  if (name.includes('\0'))    return fail('Null byte in filename — possible null-byte injection.');
+  if (name.includes(':'))     return fail('Colon in filename — possible NTFS Alternate Data Stream (ADS) attack.');
+
+  // Unicode directional override / zero-width / BOM characters
+  const dangerousCPs = new Set([
+    0x202E,0x200F,0x200E,0x202A,0x202B,0x202C,0x202D,
+    0x2066,0x2067,0x2068,0x2069,
+    0x200B,0x200C,0x200D,0xFEFF,
+  ]);
+  for (const ch of name) {
+    const cp = ch.codePointAt(0);
+    if (dangerousCPs.has(cp))
+      return fail(`Unicode control character U+${cp.toString(16).toUpperCase().padStart(4,'0')} in filename — possible display-spoofing (RLO/zero-width) attack.`);
+  }
+
+  // Windows reserved names
+  const stem = name.split('.')[0].toUpperCase();
+  if (WIN_RESERVED.has(stem)) return fail(`Windows reserved device name "${stem}" in filename — would cause undefined behavior on Windows.`);
+
+  // Double-extension: check stem before the final extension
+  const nameWithoutFinal = name.slice(0, name.lastIndexOf('.'));
+  for (const dext of DANGEROUS_EXTS) {
+    if (nameWithoutFinal.toLowerCase().endsWith(dext) ||
+        nameWithoutFinal.toLowerCase().includes(dext + '.'))
+      return fail(`Double-extension attack: filename stem contains dangerous extension "${dext}".`);
+  }
+
+  return pass(`"${name}" — all filename pattern checks passed.`);
+}
+
+async function layer6_deep(file) {
+  const ext   = getExt(file.name);
+  const bytes = await readBytes(file, Math.min(file.size, MAX_DEEP_SCAN));
+  // Latin-1 decode — matches C# Encoding.Latin1.GetString
+  const content = latin1Decode(bytes);
+
+  if (ext === '.pdf') {
+    if (!content.startsWith('%PDF-'))
+      return fail('Missing %PDF- header — not a valid PDF.');
+    if (!content.includes('%%EOF'))
+      return fail('Missing %%EOF trailer — PDF is malformed or truncated.');
+    if (content.toLowerCase().includes('/encrypt'))
+      return fail('Encrypted/password-protected PDF rejected — contents cannot be inspected (fail-closed).');
+    for (const pat of PDF_DANGEROUS) {
+      if (content.includes(pat))
+        return fail(`Dangerous PDF object detected: "${pat.trim()}" — active content not permitted in patron documents.`);
+    }
+    // OpenAction is hard-blocked only when JS is also present
+    const hasJS = ['/JS ','/JS\r','/JS\n','/JavaScript'].some(t => content.includes(t));
+    for (const trigger of PDF_TRIGGER_ACTIONS) {
+      if (content.includes(trigger) && hasJS)
+        return fail(`Dangerous PDF trigger action "${trigger.trim()}" with JavaScript detected.`);
+    }
+    return pass('PDF structure valid — no dangerous objects found.');
+  }
+
+  // Image: check for embedded executables (scan from offset 16 to skip header)
+  for (const es of EMBED_EXE_SIGS) {
+    const offset = findSeq(bytes, es.sig, 16);
+    if (offset < 16) continue;
+    if (es.validatePE && !isProbablyPE(bytes, offset)) continue;
+    return fail(`Embedded ${es.name} detected at byte offset ${offset} — classified as Malicious.`);
+  }
+
+  // Shell / code injection patterns
+  const contentLower = content.toLowerCase();
+  for (const pat of SHELL_PATTERNS) {
+    const idx = contentLower.indexOf(pat.toLowerCase());
+    if (idx >= 0 && isTextContext(bytes, idx))
+      return fail(`Embedded code pattern "${pat}" found at offset ${idx} — possible polyglot / webshell.`);
+  }
+
+  // Format-agnostic: script injection
+  const SCRIPT_PATTERNS = ['<script','javascript:','vbscript:','onerror=','onload=','<svg','<?php'];
+  for (const pat of SCRIPT_PATTERNS) {
+    const idx = contentLower.indexOf(pat.toLowerCase());
+    if (idx >= 0 && isTextContext(bytes, idx))
+      return fail(`Embedded HTML/script pattern "${pat}" found at offset ${idx}.`);
+  }
+
+  const fmt = ext.slice(1).toUpperCase();
+  return pass(`${fmt} deep scan complete — no embedded threats detected.`);
+}
+
+async function layer7_virus(/*file*/) {
+  await sleep(650); // realistic scan delay
+  return sim('Windows Defender (MpCmdRun.exe -Scan -ScanType 3) would run here. Scan result: clean (simulated).');
+}
+
+async function layer8_storage(file) {
+  await sleep(200);
+  const ext    = getExt(file.name);
+  const suffix = Array.from({length:8}, () => 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random()*36)]).join('');
+  const stored = `Smith20260421remoteDoc1${suffix}${ext}`;
+  return sim(`AES-256-GCM encrypted · Nonce: 96-bit (random) · Tag: 128-bit · Stored as "${stored}" outside wwwroot.`);
+}
+
+// ── Pipeline runner ───────────────────────────────────────────────────────────
+
+const VALIDATORS = [layer1_size, layer2_extension, layer3_mime, layer4_magic,
+                    layer5_filename, layer6_deep, layer7_virus, layer8_storage];
+
+let running = false;
+
+async function runPipeline(file) {
+  if (running) return;
+  running = true;
+
+  // Show file info bar
+  const bar = document.getElementById('fileInfoBar');
+  document.getElementById('infoName').textContent  = file.name;
+  document.getElementById('infoSize').textContent  = fmtBytes(file.size);
+  document.getElementById('infoMime').textContent  = file.type || '(no MIME)';
+  bar.classList.add('show');
+
+  document.getElementById('idleState').style.display = 'none';
+  const pipeline = document.getElementById('pipeline');
+  pipeline.style.display = 'flex';
+  renderLayers(pipeline);
+
+  const banner = document.getElementById('resultBanner');
+  banner.className = 'result-banner';
+  banner.innerHTML = '';
+
+  await sleep(80);
+
+  for (let i = 0; i < VALIDATORS.length; i++) {
+    setLayer(i, 'scanning', 'Analyzing…');
+    await sleep(180);
+    let result;
+    try {
+      result = await VALIDATORS[i](file);
+    } catch(err) {
+      result = fail('Unexpected error: ' + err.message);
+    }
+
+    if (result.simulated) {
+      setLayer(i, 'simulated', result.msg);
+      await sleep(120);
+      continue;
+    }
+
+    if (!result.ok) {
+      setLayer(i, 'rejected', result.msg);
+      for (let j = i + 1; j < LAYER_DEFS.length; j++) setLayer(j, 'skipped', 'Skipped — file already rejected.');
+      showBanner(false,
+        `🚫 Rejected at Layer ${i + 1}: ${LAYER_DEFS[i].name}`,
+        result.msg);
+      running = false;
+      return;
+    }
+    setLayer(i, 'passed', result.msg);
+    await sleep(120);
+  }
+
+  showBanner(true,
+    '✅ File Accepted — All 8 Layers Passed',
+    `"${file.name}" (${fmtBytes(file.size)}) passed the full validation pipeline.`);
+  running = false;
+}
+
+function renderLayers(container) {
+  container.innerHTML = LAYER_DEFS.map((l, i) => `
+    <div class="layer pending" id="ly${i}">
+      <div class="layer-header">
+        <div class="layer-num">${l.id}</div>
+        <div class="layer-title">${l.name}</div>
+        <div class="layer-icon" id="li${i}">·</div>
+      </div>
+      <div class="layer-desc">${l.desc}</div>
+      ${l.note ? `<div class="layer-note">⚠ ${l.note}</div>` : ''}
+      <div class="layer-result" id="lr${i}"></div>
+    </div>`).join('');
+}
+
+function setLayer(idx, state, msg) {
+  const el = document.getElementById(`ly${idx}`);
+  const ic = document.getElementById(`li${idx}`);
+  const re = document.getElementById(`lr${idx}`);
+  if (!el) return;
+  el.className = `layer ${state}`;
+  ic.textContent = { pending:'·', scanning:'◌', passed:'✓', rejected:'✕', simulated:'~', skipped:'—' }[state] || '·';
+  if (msg) re.textContent = msg;
+}
+
+function showBanner(ok, title, body) {
+  const b = document.getElementById('resultBanner');
+  b.className = `result-banner show ${ok ? 'success' : 'failure'}`;
+  b.innerHTML = `<h2>${title}</h2><p>${body}</p>`;
+}
+
+// ── Attack file factories ─────────────────────────────────────────────────────
+
+async function makeCleanJpeg(name = 'clean-photo.jpg') {
+  const canvas = document.createElement('canvas');
+  canvas.width = 32; canvas.height = 32;
+  const ctx = canvas.getContext('2d');
+  const g = ctx.createLinearGradient(0, 0, 32, 32);
+  g.addColorStop(0, '#3b82f6'); g.addColorStop(1, '#8b5cf6');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 32, 32);
+  return new Promise(r => canvas.toBlob(b => r(new File([b], name, {type:'image/jpeg'})), 'image/jpeg', 0.9));
+}
+
+const ATTACK_BUILDERS = {
+  clean:         () => makeCleanJpeg(),
+  oversized:     () => {
+    // 10.5 MB JPEG-magic bytes + zeros
+    const b = new Uint8Array(10.5 * 1024 * 1024);
+    b[0]=0xFF; b[1]=0xD8; b[2]=0xFF;
+    return new File([b], 'large-scan.jpg', {type:'image/jpeg'});
+  },
+  wrong_ext:     async () => {
+    const base = await makeCleanJpeg();
+    return new File([await base.arrayBuffer()], 'malware.exe', {type:'application/octet-stream'});
+  },
+  mime_mismatch: async () => {
+    const base = await makeCleanJpeg();
+    // .pdf extension but MIME is image/jpeg
+    return new File([await base.arrayBuffer()], 'document.pdf', {type:'image/jpeg'});
+  },
+  exe_jpg: () => {
+    // Minimal valid-looking MZ/PE header
+    const header = new Uint8Array(0x44);
+    header[0]=0x4D; header[1]=0x5A; // MZ
+    header[0x3C]=0x40;              // e_lfanew = 0x40
+    header[0x40]=0x50; header[0x41]=0x45; header[0x42]=0x00; header[0x43]=0x00; // PE\0\0
+    return new File([header], 'photo.jpg', {type:'image/jpeg'});
+  },
+  zip_jpg: () => {
+    const b = new Uint8Array([0x50,0x4B,0x03,0x04,0x14,0x00,0x00,0x00,0x08,0x00,0x00,0x00]);
+    return new File([b], 'photo.jpg', {type:'image/jpeg'});
+  },
+  double_ext: async () => {
+    const base = await makeCleanJpeg();
+    return new File([await base.arrayBuffer()], 'photo.php.jpg', {type:'image/jpeg'});
+  },
+  path_traversal: async () => {
+    const base = await makeCleanJpeg();
+    return new File([await base.arrayBuffer()], '../../etc/passwd.jpg', {type:'image/jpeg'});
+  },
+  rlo: async () => {
+    const base = await makeCleanJpeg();
+    // U+202E (RLO) makes "gpj.exe" display as "exe.jpg"
+    return new File([await base.arrayBuffer()], 'photo\u202Egpj.exe', {type:'image/jpeg'});
+  },
+  webp_avi: () => {
+    // RIFF header but AVI fourCC at offset 8 instead of WEBP
+    const b = new Uint8Array(12);
+    b[0]=0x52; b[1]=0x49; b[2]=0x46; b[3]=0x46; // RIFF
+    b[4]=0x04; b[5]=0x00; b[6]=0x00; b[7]=0x00; // size
+    b[8]=0x41; b[9]=0x56; b[10]=0x49; b[11]=0x20; // AVI (space)
+    return new File([b], 'image.webp', {type:'image/webp'});
+  },
+  pdf_js: () => {
+    const src =
+      '%PDF-1.4\n' +
+      '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n' +
+      '2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n' +
+      '3 0 obj\n<< /JavaScript /JS (app.alert("pwned");) >>\nendobj\n' +
+      'xref\n0 4\n0000000000 65535 f\n' +
+      'trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n9\n%%EOF\n';
+    return new File([new TextEncoder().encode(src)], 'form.pdf', {type:'application/pdf'});
+  },
+  php_shell: async () => {
+    const base = await makeCleanJpeg();
+    const jpg  = new Uint8Array(await base.arrayBuffer());
+    const php  = new TextEncoder().encode('\n<?php system($_GET["cmd"]); ?>\n');
+    const both = new Uint8Array(jpg.length + php.length);
+    both.set(jpg); both.set(php, jpg.length);
+    return new File([both], 'photo.jpg', {type:'image/jpeg'});
+  },
+  embedded_exe: async () => {
+    const base = await makeCleanJpeg();
+    const jpg  = new Uint8Array(await base.arrayBuffer());
+    // Craft a plausible MZ+PE header to embed past offset 16
+    const pe = new Uint8Array(0x44);
+    pe[0]=0x4D; pe[1]=0x5A;      // MZ
+    pe[0x3C]=0x40;               // e_lfanew
+    pe[0x40]=0x50; pe[0x41]=0x45; pe[0x42]=0x00; pe[0x43]=0x00; // PE\0\0
+    const both = new Uint8Array(jpg.length + pe.length);
+    both.set(jpg); both.set(pe, jpg.length);
+    return new File([both], 'photo.jpg', {type:'image/jpeg'});
+  },
+  encrypted_pdf: () => {
+    const src =
+      '%PDF-1.6\n' +
+      '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n' +
+      '2 0 obj\n<< /Encrypt 3 0 R >>\nendobj\n' +
+      '3 0 obj\n<< /Filter /Standard /V 4 >>\nendobj\n' +
+      'xref\n0 4\ntrailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n9\n%%EOF\n';
+    return new File([new TextEncoder().encode(src)], 'protected.pdf', {type:'application/pdf'});
+  },
+};
+
+async function runTest(type) {
+  if (running) { running = false; await sleep(50); }
+  const factory = ATTACK_BUILDERS[type];
+  if (!factory) return;
+  const file = await factory();
+  runPipeline(file);
+}
+
+// ── Utility functions ─────────────────────────────────────────────────────────
+
+function getExt(name) {
+  const i = name.lastIndexOf('.');
+  return i >= 0 ? name.slice(i).toLowerCase() : '';
+}
+
+function readBytes(file, count) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload  = e => resolve(new Uint8Array(e.target.result));
+    r.onerror = () => reject(new Error('File read error'));
+    r.readAsArrayBuffer(file.slice(0, count));
+  });
+}
+
+function matchesAt(data, sig, offset) {
+  if (data.length < offset + sig.length) return false;
+  for (let i = 0; i < sig.length; i++) if (data[offset+i] !== sig[i]) return false;
+  return true;
+}
+
+function findSeq(haystack, needle, start = 0) {
+  outer: for (let i = start; i <= haystack.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (haystack[i+j] !== needle[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+function isProbablyPE(bytes, mzOffset) {
+  if (mzOffset + 0x40 > bytes.length) return false;
+  const peOff = bytes[mzOffset+0x3C] | (bytes[mzOffset+0x3D]<<8) |
+                (bytes[mzOffset+0x3E]<<16) | (bytes[mzOffset+0x3F]<<24);
+  const absPE = mzOffset + peOff;
+  if (peOff < 4 || absPE + 4 > bytes.length) return false;
+  return bytes[absPE]===0x50 && bytes[absPE+1]===0x45 && bytes[absPE+2]===0x00 && bytes[absPE+3]===0x00;
+}
+
+function isTextContext(bytes, offset, window = 20) {
+  const end = Math.min(bytes.length, offset + window);
+  let printable = 0;
+  for (let i = offset; i < end; i++) {
+    const b = bytes[i];
+    if ((b >= 0x20 && b <= 0x7E) || b === 0x09 || b === 0x0A || b === 0x0D) printable++;
+  }
+  return (end > offset) && (printable / (end - offset)) >= 0.7;
+}
+
+function latin1Decode(bytes) {
+  // Mirror C# Encoding.Latin1.GetString — codepoint == byte value
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return s;
+}
+
+function toHex(bytes, n) {
+  return Array.from(bytes.slice(0, n)).map(b => b.toString(16).padStart(2,'0').toUpperCase()).join(' ');
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024*1024) return `${(n/1024).toFixed(1)} KB`;
+  return `${(n/1024/1024).toFixed(2)} MB`;
+}
+
+function pass(msg) { return { ok:true,  msg }; }
+function fail(msg) { return { ok:false, msg }; }
+function sim(msg)  { return { ok:true,  msg, simulated:true }; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ── File input + drag-drop ────────────────────────────────────────────────────
+
+document.getElementById('fileInput').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (f) { e.target.value = ''; runPipeline(f); }
+});
+
+const dz = document.getElementById('dropZone');
+dz.addEventListener('dragover',  e => { e.preventDefault(); dz.classList.add('dragging'); });
+dz.addEventListener('dragleave', ()  => dz.classList.remove('dragging'));
+dz.addEventListener('dragend',   ()  => dz.classList.remove('dragging'));
+dz.addEventListener('drop', e => {
+  e.preventDefault();
+  dz.classList.remove('dragging');
+  const f = e.dataTransfer.files[0];
+  if (f) runPipeline(f);
+});
+</script>
+</body>
+</html>
