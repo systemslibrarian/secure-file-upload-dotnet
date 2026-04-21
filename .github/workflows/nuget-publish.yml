@@ -17,6 +17,9 @@ jobs:
     name: Build & Pack
     runs-on: ubuntu-latest
 
+    outputs:
+      package_version: ${{ steps.package-version.outputs.package_version }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,6 +30,24 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+
+      - name: Determine package version
+        id: package-version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            PACKAGE_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            PACKAGE_VERSION="$(grep -oPm1 '(?<=<Version>)[^<]+' src/SecureFileUpload.Core.csproj)"
+          fi
+
+          if [[ -z "$PACKAGE_VERSION" ]]; then
+            echo "::error::Could not determine package version."
+            exit 1
+          fi
+
+          echo "package_version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using package version: $PACKAGE_VERSION"
 
       - name: Restore
         run: dotnet restore src/SecureFileUpload.Core.csproj
@@ -39,10 +60,11 @@ jobs:
           dotnet pack src/SecureFileUpload.Core.csproj
           --configuration Release
           --no-build
+          /p:Version=${{ steps.package-version.outputs.package_version }}
           --output nupkgs
-        # Version is read from the <Version> property in the .csproj.
-        # Override on the CLI when tagging a release:
-        #   dotnet pack … /p:Version=1.2.3
+        # On tag builds, the published package version is derived from the tag:
+        #   v1.2.3 -> 1.2.3
+        #   v1.2.3-preview.1 -> 1.2.3-preview.1
 
       - name: Upload NuGet artifacts
         uses: actions/upload-artifact@v4
@@ -125,6 +147,22 @@ jobs:
           --api-key "$NUGET_API_KEY"
           --source https://api.nuget.org/v3/index.json
           --skip-duplicate
+
+      - name: Push symbols to NuGet.org
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          shopt -s nullglob
+          snupkgs=(nupkgs/*.snupkg)
+          if [ ${#snupkgs[@]} -eq 0 ]; then
+            echo "No symbol packages found; skipping symbol publish."
+            exit 0
+          fi
+
+          dotnet nuget push "${snupkgs[@]}" \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
         # NUGET_API_KEY must be set in the repository's
         # Settings → Secrets → Actions → New repository secret.
         # Scope the key to this package only in your NuGet.org account.

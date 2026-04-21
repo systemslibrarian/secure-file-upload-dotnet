@@ -4,13 +4,13 @@
 
 [![NuGet](https://img.shields.io/nuget/v/SecureFileUpload.Core.svg)](https://www.nuget.org/packages/SecureFileUpload.Core)
 [![Build](https://github.com/systemslibrarian/secure-file-upload-dotnet/actions/workflows/nuget-publish.yml/badge.svg)](https://github.com/systemslibrarian/secure-file-upload-dotnet/actions/workflows/nuget-publish.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/LICENSE.md)
 
 An 8-layer file upload validation and storage pipeline derived from a production ASP.NET Core 8 document-intake workflow. The code has been de-branded, generalized, and published for reuse — it is the same pipeline structure used in production, not a toy example.
 
-The goal of this repo is to show what a *measured, fail-closed* upload pipeline looks like in real C#: every claim below is backed by code in [`src/`](src), and every known limitation is documented in [`KNOWN-GAPS.md`](KNOWN-GAPS.md).
+The goal of this repo is to show what a *measured, fail-closed* upload pipeline looks like in real C#: every claim below is backed by code in [`src/`](https://github.com/systemslibrarian/secure-file-upload-dotnet/tree/main/src), and every known limitation is documented in [`KNOWN-GAPS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/KNOWN-GAPS.md).
 
-[`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) records a structured adversarial AI red-team review of this exact code — original findings, current resolution status, and the residual gaps that remain.
+[`SECURITY-ANALYSIS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY-ANALYSIS.md) records a structured adversarial AI red-team review of this exact code — original findings, current resolution status, and the residual gaps that remain.
 
 > *"So whether you eat or drink or whatever you do, do it all for the glory of God."*
 > — 1 Corinthians 10:31
@@ -100,15 +100,13 @@ Every uploaded file passes through all layers in order. **Failure at any validat
 
 ## Source Files
 
-| File | Purpose |
-|------|---------|
-| `src/FileUploadService.cs` | Orchestrates the full 8-layer pipeline. Handles batch limits, disk capacity checks, image recompression (Gap 1 mitigation), envelope-encrypted write (v2), decryption for retrieval, log-poisoning-safe filename handling. |
-| `src/FileContentValidator.cs` | Layer 6 deep content validation. Format-specific structural walking for JPEG, PNG, WebP, PDF. Pattern-based threat detection. **FlateDecode-compressed PDF stream inspection** (Gap 2 mitigation). Fail-closed on unknown types. |
-| `src/WindowsDefenderScanService.cs` | Layer 7 virus scanning via Windows Defender `MpCmdRun.exe`. Includes temp-file secure delete (zero-before-delete). Use on Windows. |
-| `src/ClamAvScanService.cs` | Layer 7 virus scanning via `clamd` over TCP using the `zINSTREAM` protocol. No temp file written — patron bytes never touch disk. Use on Linux / containers / macOS. |
-| `src/SecureFileDownloadController.cs` | Reference staff-side download handler. Forces `Content-Disposition: attachment`, locks down response headers (CSP `sandbox`, `nosniff`, `X-Frame-Options: DENY`, COOP/COEP/CORP, no-store), and re-checks path traversal at read time. |
-| `src/ReplacementCardInputModel.cs` | Example model showing how file uploads are bound via `List<IFormFile>` in a multipart form alongside validated patron fields. |
-| `tests/Fuzz/` | SharpFuzz + AFL++ harness for `FileContentValidator.ValidateAsync`. Catches unhandled exceptions, hangs, and runaway allocation in attacker-crafted inputs. See `tests/Fuzz/README.md`. |
+- `src/FileUploadService.cs` — Orchestrates the full 8-layer pipeline. Handles batch limits, disk capacity checks, image recompression (Gap 1 mitigation), envelope-encrypted write (v2), decryption for retrieval, log-poisoning-safe filename handling.
+- `src/FileContentValidator.cs` — Layer 6 deep content validation. Format-specific structural walking for JPEG, PNG, WebP, PDF. Pattern-based threat detection. **FlateDecode-compressed PDF stream inspection** (Gap 2 mitigation). Fail-closed on unknown types.
+- `src/WindowsDefenderScanService.cs` — Layer 7 virus scanning via Windows Defender `MpCmdRun.exe`. Includes temp-file secure delete (zero-before-delete). Use on Windows.
+- `src/ClamAvScanService.cs` — Layer 7 virus scanning via `clamd` over TCP using the `zINSTREAM` protocol. No temp file written — patron bytes never touch disk. Use on Linux / containers / macOS.
+- `src/SecureFileDownloadController.cs` — Reference staff-side download handler. Forces `Content-Disposition: attachment`, locks down response headers (CSP `sandbox`, `nosniff`, `X-Frame-Options: DENY`, COOP/COEP/CORP, no-store), and re-checks path traversal at read time.
+- `src/ReplacementCardInputModel.cs` — Example model showing how file uploads are bound via `List<IFormFile>` in a multipart form alongside validated patron fields.
+- `tests/Fuzz/` — SharpFuzz + AFL++ harness for `FileContentValidator.ValidateAsync`. Catches unhandled exceptions, hangs, and runaway allocation in attacker-crafted inputs. See `tests/Fuzz/README.md`.
 
 ---
 
@@ -117,7 +115,7 @@ Every uploaded file passes through all layers in order. **Failure at any validat
 ### Fail-Closed on Content Decisions
 Unknown file types, malformed structures, deep-validation exceptions, missing or placeholder encryption secrets, and storage paths inside `wwwroot` all result in rejection or refusal to start. The default for any *content* decision is **deny**, not allow.
 
-The one deliberate exception is **virus-scanner availability** (Layer 7). A scanner that returns *infected* always rejects the file. A scanner that is unreachable, times out, or throws is treated as **fail-open with explicit `NotScanned` tracking** — the file is accepted only because Layers 1–6 have already cleared it, and the outcome is surfaced in `FileUploadResult.ScanNotScannedCount` and logged as `VIRUS_SCAN_OPERATIONAL_FAILURE`. This is documented in [`KNOWN-GAPS.md`](KNOWN-GAPS.md) and is the right trade-off for a patron-document workflow where a `clamd` outage must not block legitimate registrations; deployments that need scanner-availability to be hard-blocking should switch to a queued-scan model (see [`docs/hardening-roadmap.md`](docs/hardening-roadmap.md) §1.3).
+The one deliberate exception is **virus-scanner availability** (Layer 7). A scanner that returns *infected* always rejects the file. A scanner that is unreachable, times out, or throws is treated as **fail-open with explicit `NotScanned` tracking** — the file is accepted only because Layers 1–6 have already cleared it, and the outcome is surfaced in `FileUploadResult.ScanNotScannedCount` and logged as `VIRUS_SCAN_OPERATIONAL_FAILURE`. This is documented in [`KNOWN-GAPS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/KNOWN-GAPS.md) and is the right trade-off for a patron-document workflow where a `clamd` outage must not block legitimate registrations; deployments that need scanner-availability to be hard-blocking should switch to a queued-scan model (see [`docs/hardening-roadmap.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/docs/hardening-roadmap.md) §1.3).
 
 ### Signature-First Classification (FileContentValidator)
 The deep validator detects the *actual* file type from magic bytes before dispatching to the format-specific validator. A file claiming to be `.jpg` that opens with `%PDF` gets caught as a type mismatch before any format-specific logic runs.
@@ -258,6 +256,28 @@ Requires .NET 8+ with ASP.NET Core. The package targets `net8.0` and depends on 
 
 ---
 
+## Release Process
+
+NuGet publishing is handled by GitHub Actions via `.github/workflows/nuget-publish.yml`.
+
+1. Push changes to `main` to run the build, pack, and fuzz-harness checks without publishing.
+2. Ensure the repository or `nuget-publish` environment has a `NUGET_API_KEY` secret scoped to `SecureFileUpload.Core`.
+3. Push a version tag to publish to NuGet.org. The workflow derives the package version directly from the tag name:
+  - `v1.0.1` publishes package version `1.0.1`
+  - `v1.0.1-preview.1` publishes package version `1.0.1-preview.1`
+4. The workflow pushes both the `.nupkg` and `.snupkg` artifacts with `--skip-duplicate`, so a re-run is non-destructive if the version already exists.
+
+Example:
+
+```bash
+git tag v1.0.1-preview.1
+git push origin v1.0.1-preview.1
+```
+
+The project file's `<Version>` remains useful for local packs and non-tag CI artifacts, but tag builds are the source of truth for published NuGet versions.
+
+---
+
 ## Integration Pattern
 
 ### Minimal registration (recommended)
@@ -328,12 +348,12 @@ public async Task<IActionResult> Submit(MyInputModel model)
 
 ## Docs
 
-- [`docs/threat-model.md`](docs/threat-model.md) — What attack each layer defeats
-- [`docs/hardening-roadmap.md`](docs/hardening-roadmap.md) — Recommendations to reach the strongest realistic posture
-- [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) — AI red-team adversarial findings (with current resolution status)
-- [`KNOWN-GAPS.md`](KNOWN-GAPS.md) — Honest limitations and what this does NOT protect against
-- [`tests/attack-vectors.md`](tests/attack-vectors.md) — Per-layer attack test cases (manual + automation guide)
-- [`tests/Fuzz/`](tests/Fuzz) — SharpFuzz + AFL++ harness for the deep content validator
+- [`docs/threat-model.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/docs/threat-model.md) — What attack each layer defeats
+- [`docs/hardening-roadmap.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/docs/hardening-roadmap.md) — Recommendations to reach the strongest realistic posture
+- [`SECURITY-ANALYSIS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY-ANALYSIS.md) — AI red-team adversarial findings (with current resolution status)
+- [`KNOWN-GAPS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/KNOWN-GAPS.md) — Honest limitations and what this does NOT protect against
+- [`tests/attack-vectors.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/tests/attack-vectors.md) — Per-layer attack test cases (manual + automation guide)
+- [`tests/Fuzz/`](https://github.com/systemslibrarian/secure-file-upload-dotnet/tree/main/tests/Fuzz) — SharpFuzz + AFL++ harness for the deep content validator
 
 ---
 
