@@ -2,7 +2,7 @@
 
 **Production-grade, defense-in-depth file upload security for ASP.NET Core 8+**
 
-This repository contains the complete C# file upload security pipeline from a live public-sector ASP.NET Core 8 application — a patron registration system for a public library. The code is real production code, not a toy example. It has been de-branded and generalized for community use.
+This repository contains a complete C# file upload security pipeline derived from a production ASP.NET Core 8 application. The code has been de-branded and generalized for community use.
 
 The companion `SECURITY-ANALYSIS.md` documents a structured adversarial AI red-team review of this exact code, including real findings, honest gaps, and recommendations.
 
