@@ -477,10 +477,11 @@ namespace SecureFileUpload.Services
                     var (isValid, errorMessage) = ValidateFile(file);
                     if (!isValid)
                     {
+                        var safeName = SanitizeForLog(file.FileName);
                         _logger.LogWarning(
-                            "FILE_REJECTED | Reason: {Reason} | Form: {FormType}",
-                            errorMessage, formType);
-                        result.Errors.Add($"File '{file.FileName}': {errorMessage}");
+                            "FILE_REJECTED | FileName: {FileName} | Reason: {Reason} | Form: {FormType}",
+                            safeName, errorMessage, formType);
+                        result.Errors.Add($"File '{safeName}': {errorMessage}");
                         continue;
                     }
 
@@ -500,7 +501,7 @@ namespace SecureFileUpload.Services
                             ? "Password-protected PDFs cannot be accepted because their contents cannot be inspected for safety. Please upload an unprotected copy of this document."
                             : "File failed validation.";
 
-                        result.Errors.Add($"File '{file.FileName}': {userMessage}");
+                        result.Errors.Add($"File '{SanitizeForLog(file.FileName)}': {userMessage}");
                         continue;
                     }
 
@@ -518,7 +519,7 @@ namespace SecureFileUpload.Services
                             break;
 
                         case VirusScanOutcome.Infected:
-                            result.Errors.Add($"File '{file.FileName}': File rejected.");
+                            result.Errors.Add($"File '{SanitizeForLog(file.FileName)}': File rejected.");
                             infectedRejected++;
                             continue; // skip writing this file
 
@@ -540,7 +541,7 @@ namespace SecureFileUpload.Services
                         _logger.LogError(
                             "SECURITY_EVENT | FILE_PATH_TRAVERSAL | ResolvedPath: {Path}",
                             filePath);
-                        result.Errors.Add($"Invalid file path for '{file.FileName}'.");
+                        result.Errors.Add($"Invalid file path for '{SanitizeForLog(file.FileName)}'.");
                         continue;
                     }
 
@@ -561,7 +562,7 @@ namespace SecureFileUpload.Services
                     {
                         _logger.LogError(ex,
                             "FILE_SAVE_ERROR | Path: {Path}", filePath);
-                        result.Errors.Add($"Failed to save '{file.FileName}'. Please try again.");
+                        result.Errors.Add($"Failed to save '{SanitizeForLog(file.FileName)}'. Please try again.");
                     }
                 }
 
@@ -889,7 +890,7 @@ namespace SecureFileUpload.Services
 
             _logger.LogInformation(
                 "VIRUS_SCAN_INITIATED | File: {FileName} | Size: {SizeKB} KB | FormType: {FormType} | PatronLastName: {LastName} | Folder: {Folder}",
-                file.FileName, file.Length / 1024, formType, sanitizedLastName, submissionFolder);
+                SanitizeForLog(file.FileName), file.Length / 1024, formType, sanitizedLastName, submissionFolder);
 
             VirusScanResult scanResult;
             try
@@ -904,7 +905,7 @@ namespace SecureFileUpload.Services
                     "VIRUS_SCAN_ERROR | Scanner: {Scanner} | File: {FileName} | FormType: {FormType} | " +
                     "File accepted as NotScanned (passed validation layers 1–6). " +
                     "Scanner exception does not block validated uploads.",
-                    _virusScanService.ScannerName, file.FileName, formType);
+                    _virusScanService.ScannerName, SanitizeForLog(file.FileName), formType);
                 return VirusScanOutcome.NotScanned;
             }
 
@@ -912,7 +913,7 @@ namespace SecureFileUpload.Services
             {
                 _logger.LogInformation(
                     "VIRUS_SCAN_CLEAN | Scanner: {Scanner} | File: {FileName} | FormType: {FormType} | Duration: {Ms}ms",
-                    _virusScanService.ScannerName, file.FileName, formType, scanResult.ScanDurationMs);
+                    _virusScanService.ScannerName, SanitizeForLog(file.FileName), formType, scanResult.ScanDurationMs);
                 return VirusScanOutcome.Clean;
             }
 
@@ -920,7 +921,7 @@ namespace SecureFileUpload.Services
             {
                 _logger.LogWarning(
                     "SECURITY_EVENT | VIRUS_DETECTED | Scanner: {Scanner} | File: {FileName} | Threat: {Threat} | FormType: {FormType} | PatronLastName: {LastName}",
-                    _virusScanService.ScannerName, file.FileName, scanResult.ThreatName ?? "unknown", formType, sanitizedLastName);
+                    _virusScanService.ScannerName, SanitizeForLog(file.FileName), SanitizeForLog(scanResult.ThreatName ?? "unknown"), formType, sanitizedLastName);
                 return VirusScanOutcome.Infected;
             }
 
@@ -928,7 +929,7 @@ namespace SecureFileUpload.Services
             _logger.LogWarning(
                 "VIRUS_SCAN_OPERATIONAL_FAILURE | Scanner: {Scanner} | File: {FileName} | Message: {Msg} | FormType: {FormType} | " +
                 "File accepted as NotScanned (passed validation layers 1–6).",
-                _virusScanService.ScannerName, file.FileName, scanResult.Message, formType);
+                _virusScanService.ScannerName, SanitizeForLog(file.FileName), SanitizeForLog(scanResult.Message), formType);
             return VirusScanOutcome.NotScanned;
         }
 
@@ -1244,6 +1245,46 @@ namespace SecureFileUpload.Services
             if (string.IsNullOrWhiteSpace(result)) return "unknown";
             if (result.Length > 50) result = result.Substring(0, 50);
             return result;
+        }
+
+        /// <summary>
+        /// Renders an attacker-controlled filename safely for use in log messages
+        /// and user-facing error strings. Strips control characters, ANSI escape
+        /// sequences, log-format injection chars (`|`, `{`, `}`, `\r`, `\n`, `\t`),
+        /// and Unicode bidi/zero-width tricks. Truncates to 128 chars.
+        /// Mitigates SECURITY-ANALYSIS Finding 4 (log poisoning via filename).
+        /// </summary>
+        private static string SanitizeForLog(string? fileName)
+        {
+            if (string.IsNullOrEmpty(fileName)) return "(empty)";
+
+            const int maxLen = 128;
+            var sb = new StringBuilder(Math.Min(fileName.Length, maxLen));
+
+            foreach (var c in fileName)
+            {
+                if (sb.Length >= maxLen) { sb.Append('…'); break; }
+
+                // Strip log-format injection and structured-log placeholders.
+                if (c == '\r' || c == '\n' || c == '\t' || c == '\0' ||
+                    c == '|'  || c == '{'  || c == '}'  ||
+                    c == '\u001B' /* ESC */ ||
+                    char.IsControl(c))
+                { sb.Append('?'); continue; }
+
+                // Unicode bidi / zero-width / BOM tricks.
+                if (c == '\u202E' || c == '\u202D' || c == '\u202C' ||
+                    c == '\u202B' || c == '\u202A' ||
+                    c == '\u2066' || c == '\u2067' || c == '\u2068' || c == '\u2069' ||
+                    c == '\u200E' || c == '\u200F' ||
+                    c == '\u200B' || c == '\u200C' || c == '\u200D' ||
+                    c == '\uFEFF')
+                { sb.Append('?'); continue; }
+
+                sb.Append(c);
+            }
+
+            return sb.ToString();
         }
 
         /// <summary>

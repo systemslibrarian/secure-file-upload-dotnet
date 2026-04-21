@@ -93,14 +93,14 @@ All tests assume the pipeline is configured with default settings unless otherwi
 | 6.6 | A PDF containing `/JSON` | Passes: `/JSON` does not match the exact JS trigger tokens |
 | 6.7 | A password-protected/encrypted PDF | Rejected: `RejectEncryptedPdfs: true` (default) |
 | 6.8 | A valid, clean PDF (utility bill scan) | Passes Layer 6 |
-| 6.9 | A PDF containing JavaScript in a FlateDecode compressed stream | Passes Layer 6 — see KNOWN-GAPS.md |
+| 6.9 | A PDF containing JavaScript in a FlateDecode compressed stream | Rejected: `PDF-CompressedStreamThreat` (`ScanCompressedPdfStreams` decompresses and re-runs the dangerous-pattern scan). |
 
 ### JPEG Tests
 
 | # | What to submit | Expected outcome |
 |---|----------------|-----------------|
 | 6.10 | A JPEG with malformed segment lengths | Rejected: JPEG segment walker |
-| 6.11 | A valid JPEG with `#!/bin/sh` appended after EOI | Passes Layer 6 — see KNOWN-GAPS.md (polyglot gap) |
+| 6.11 | A valid JPEG with `#!/bin/sh` appended after EOI | Layer 6: passes (tail tolerated). Layer 8: image is recompressed via ImageSharp — the appended payload is **stripped** before encryption (Gap 1 mitigation). Set `FileUpload:RecompressImages=false` to opt out. |
 | 6.12 | A valid JPEG with a PE executable embedded at the start | Rejected: embedded executable signature scan |
 | 6.13 | A valid JPEG with `<script>` tag in EXIF comment field | Rejected: embedded script pattern scan |
 | 6.14 | A file with JPEG magic bytes but containing a PE executable body | Rejected: JPEG segment walker fails immediately after the SOI marker |
@@ -124,7 +124,8 @@ All tests assume the pipeline is configured with default settings unless otherwi
 | 7.1 | EICAR test file (standard AV test) as `eicar.jpg` (with valid JPEG header added) | `VirusScan:Enabled: true` | Rejected: virus scan detects EICAR signature |
 | 7.2 | A clean JPEG | `VirusScan:Enabled: true` | Passes: no threat detected |
 | 7.3 | Any file | `VirusScan:Enabled: false` | Scan skipped; file proceeds to Layer 8 if all other layers pass |
-| 7.4 | Any file | Scanner binary missing | Rejected: fail-closed — scanner unavailable |
+| 7.4 | Any file | Scanner binary missing / `clamd` unreachable | File accepted as `NotScanned` (fail-open on availability), counted in `ScanNotScannedCount`. A clear malware **signature** is fail-closed; transient unavailability is not. |
+| 7.5 | Any file | `ClamAvScanService` registered, `clamd` running, EICAR submitted | Rejected with `ValidationType` containing the threat name from clamd. |
 
 ---
 
@@ -133,10 +134,13 @@ All tests assume the pipeline is configured with default settings unless otherwi
 | # | What to test | Expected outcome |
 |---|-------------|-----------------|
 | 8.1 | Attempt to access uploaded files via web URL | 404 or access denied — uploads are outside wwwroot |
-| 8.2 | Inspect stored file bytes when encryption is enabled | AES-256-GCM ciphertext with GCM marker prefix |
+| 8.2 | Inspect stored file bytes when encryption is enabled | Begins with `ENCGCM\0\x02` (envelope v2) or `ENCGCM\0\x01` (legacy v1) marker; remainder is AES-256-GCM ciphertext + auth tags |
 | 8.3 | Inspect stored filenames | Randomized: `{lastName}{date}{formType}Doc{n}{random}.ext` — no original filename |
 | 8.4 | Configure `StorageRoot` to a path inside wwwroot | Application refuses to start |
 | 8.5 | Set `EncryptionEnabled: true` with placeholder secret | Application refuses to start |
+| 8.6 | Read back a v1-encrypted file after upgrading to v2 | `GetDecryptedFileStreamAsync` dispatches to `DecryptV1SingleKey` and returns the plaintext (backward-compatible). |
+| 8.7 | Tamper one byte of the wrapped DEK in a stored v2 file | Decryption fails closed — GCM tag mismatch logged as `FILE_DECRYPT_KEK_FAIL`. |
+| 8.8 | Upload `polyglot.jpg` (valid JPEG + PHP after EOI) with `RecompressImages=true` | Stored file is the re-encoded image only; PHP tail is **not present** on disk. |
 
 ---
 

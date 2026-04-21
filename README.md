@@ -66,19 +66,23 @@ Every uploaded file passes through all layers in order. **Failure at any layer r
           ┌───────────────▼────────────────┐
           │  Layer 6: Deep Content          │  Format-specific structural walking:
           │  Validation (FileContentValidator) │  JPEG segment walker, PNG chunk walker,
-          │                                 │  WebP RIFF tree, PDF pattern scan
+          │                                 │  WebP RIFF tree, PDF pattern scan,
+          │                                 │  PDF FlateDecode stream inspection.
           │                                 │  Detects embedded executables, scripts,
           │                                 │  JavaScript in PDF, dangerous PDF objects
           └───────────────┬────────────────┘
                           │
           ┌───────────────▼────────────────┐
-          │  Layer 7: Virus Scan            │  Windows Defender (MpCmdRun.exe) or ClamAV
-          │  (IVirusScanService)            │  Fail-closed: scanner unavailable = rejection
+          │  Layer 7: Virus Scan            │  Windows Defender (Windows) OR
+          │  (IVirusScanService)            │  ClamAV via clamd zINSTREAM (Linux/cross-platform).
+          │                                 │  Fail-closed on scanner error.
           │                                 │  Only runs when VirusScan:Enabled=true
           └───────────────┬────────────────┘
                           │
           ┌───────────────▼────────────────┐
-          │  Layer 8: Encrypted Storage     │  AES-256-GCM authenticated encryption
+          │  Layer 8: Encrypted Storage     │  AES-256-GCM envelope encryption (v2):
+          │                                 │  per-file random DEK wrapped under master KEK.
+          │                                 │  Image recompression strips polyglot tails.
           │                                 │  Randomized filename, outside wwwroot,
           │                                 │  path traversal re-checked before write
           └───────────────┴────────────────┘
@@ -90,9 +94,10 @@ Every uploaded file passes through all layers in order. **Failure at any layer r
 
 | File | Purpose |
 |------|---------|
-| `src/FileUploadService.cs` | Orchestrates the full 8-layer pipeline. Handles batch limits, disk capacity checks, encrypted write, decryption for retrieval. |
-| `src/FileContentValidator.cs` | Layer 6 deep content validation. Format-specific structural walking for JPEG, PNG, WebP, PDF. Pattern-based threat detection. Fail-closed on unknown types. |
-| `src/WindowsDefenderScanService.cs` | Layer 7 virus scanning via Windows Defender MpCmdRun.exe. Includes temp-file secure delete (zero-before-delete). |
+| `src/FileUploadService.cs` | Orchestrates the full 8-layer pipeline. Handles batch limits, disk capacity checks, image recompression (Gap 1 mitigation), envelope-encrypted write (v2), decryption for retrieval, log-poisoning-safe filename handling. |
+| `src/FileContentValidator.cs` | Layer 6 deep content validation. Format-specific structural walking for JPEG, PNG, WebP, PDF. Pattern-based threat detection. **FlateDecode-compressed PDF stream inspection** (Gap 2 mitigation). Fail-closed on unknown types. |
+| `src/WindowsDefenderScanService.cs` | Layer 7 virus scanning via Windows Defender `MpCmdRun.exe`. Includes temp-file secure delete (zero-before-delete). Use on Windows. |
+| `src/ClamAvScanService.cs` | Layer 7 virus scanning via `clamd` over TCP using the `zINSTREAM` protocol. No temp file written — patron bytes never touch disk. Use on Linux / containers / macOS. |
 | `src/ReplacementCardInputModel.cs` | Example model showing how file uploads are bound via `List<IFormFile>` in a multipart form alongside validated patron fields. |
 
 ---
@@ -114,8 +119,32 @@ The storage root is validated at construction time to be outside `wwwroot`. If s
 ### Randomized Filenames
 Files are stored as `{sanitizedLastName}{dateStamp}{formType}Doc{n}{randomSuffix}.ext`. The original filename is never used on disk. This prevents filename-based path traversal and removes any attacker control over the final storage path.
 
-### AES-256-GCM with PBKDF2
-When encryption is enabled, files are encrypted with AES-256-GCM (authenticated encryption). The key is derived via PBKDF2-SHA256 at 600,000 iterations (OWASP 2024 recommendation). The application refuses to start if `EncryptionEnabled=true` but the secret is missing or still set to the placeholder.
+### AES-256-GCM with PBKDF2 (Envelope Encryption)
+When encryption is enabled, files are stored using **envelope encryption (format v2)**:
+
+1. A fresh random 256-bit Data Encryption Key (DEK) is generated per file.
+2. The file payload is encrypted under the DEK with AES-256-GCM.
+3. The DEK itself is then wrapped (encrypted) under the master Key Encryption Key (KEK), which is derived from `EncryptionSecret` via PBKDF2-SHA256 at 600,000 iterations (OWASP 2024 recommendation).
+4. Layout on disk: `marker || dek_nonce || dek_tag || wrapped_dek || file_nonce || file_tag || ciphertext`.
+
+This means **rotating the master key requires only re-wrapping each file's DEK** — the file payloads themselves don't need to be re-encrypted. Legacy single-key v1 files remain readable for backward compatibility. The application refuses to start if `EncryptionEnabled=true` but the secret is missing or still set to the placeholder.
+
+### Image Recompression (Polyglot Defence)
+When `FileUpload:RecompressImages=true` (default), JPEG / PNG / WebP uploads are decoded and re-encoded through ImageSharp before encryption. This **strips any data appended after the image's structural end** (the polyglot vector — a JPEG that's also a valid PHP/EXE). PDFs and other formats are untouched.
+
+### FlateDecode-compressed PDF Stream Inspection
+The PDF validator walks every `stream … endstream` block, attempts `DeflateStream` decompression, and re-runs the dangerous-pattern scan against the decompressed bytes. This catches `/JavaScript`, `/Launch`, etc. hidden inside compressed object streams. Bounded by `MaxCompressedStreamsToInspect` and `MaxDecompressedStreamBytes` for zip-bomb safety.
+
+### Log-Poisoning-Safe Filename Handling
+Every attacker-controlled filename is run through `SanitizeForLog` before being written to logs or echoed in user-facing error messages. Strips ANSI escape sequences, control characters, structured-log placeholders (`{`, `}`, `|`), CRLF, and Unicode bidi/zero-width tricks.
+
+### Cross-Platform Virus Scanning
+`IVirusScanService` has two production implementations:
+
+- **`WindowsDefenderScanService`** — invokes `MpCmdRun.exe`; requires Windows.
+- **`ClamAvScanService`** — talks to `clamd` directly over TCP using the documented `zINSTREAM` protocol. No temp file is written. Cross-platform (Linux, macOS, containers).
+
+Both are fail-closed: any scanner exception or error response causes the upload to be marked NotScanned (file already passed Layers 1–6, never silently "clean").
 
 ### Secure Temp File Deletion (WindowsDefenderScanService)
 The virus scanner writes files to a temp directory for scanning. After scanning, the temp file is overwritten with zeros before deletion. This reduces (though does not guarantee) recovery of sensitive content from freed disk sectors.
@@ -140,8 +169,20 @@ Path traversal checks use a proper base-path check rather than `string.StartsWit
     "MinStorageFreeBytes": 536870912,
     "MinTempFreeBytes": 536870912,
     "LowDiskWarningBytes": 2147483648,
+    "RecompressImages": true,
+    "JpegRecompressQuality": 95,
     "EncryptionEnabled": false,
     "EncryptionSecret": "CHANGE_THIS_TO_A_REAL_SECRET_MINIMUM_32_CHARS"
+  },
+  "FileContent": {
+    "InspectCompressedPdfStreams": true,
+    "MaxCompressedStreamsToInspect": 64,
+    "MaxDecompressedStreamBytes": 16777216,
+    "RejectEncryptedPdfs": true,
+    "RejectInteractivePdfs": false,
+    "MaxImageWidth": 10000,
+    "MaxImageHeight": 10000,
+    "MaxImagePixels": 40000000
   },
   "VirusScan": {
     "Enabled": false,
@@ -149,6 +190,12 @@ Path traversal checks use a proper base-path check rather than `string.StartsWit
       "MpCmdRunPath": "C:\\Program Files\\Windows Defender\\MpCmdRun.exe",
       "TempScanPath": "C:\\Temp\\VirusScan",
       "TimeoutSeconds": 30
+    },
+    "ClamAv": {
+      "Host": "localhost",
+      "Port": 3310,
+      "TimeoutSeconds": 30,
+      "MaxStreamBytes": 26214400
     }
   }
 }
@@ -158,13 +205,19 @@ Path traversal checks use a proper base-path check rather than `string.StartsWit
 
 **EncryptionSecret** must be at least 32 characters and must not contain the string `CHANGE_THIS`. If `EncryptionEnabled` is true and the secret fails this check, **the application will not start**.
 
+**RecompressImages** defaults to `true`. Set it to `false` only if byte-exact preservation of patron-uploaded images is a hard requirement (you accept the polyglot risk).
+
+**ClamAv:MaxStreamBytes** must align with the `StreamMaxLength` setting in your `clamd.conf`.
+
 ---
 
 ## Dependencies
 
 - .NET 8+
-- [SixLabors.ImageSharp](https://github.com/SixLabors/ImageSharp) — used in `FileContentValidator` for `Image.Identify()` (structural validation without full pixel decode)
-- Windows Defender (`MpCmdRun.exe`) for Layer 7 — or swap in ClamAV by implementing `IVirusScanService`
+- [SixLabors.ImageSharp](https://github.com/SixLabors/ImageSharp) — used in `FileContentValidator` for `Image.Identify()` (structural validation without full pixel decode) and in `FileUploadService` for image recompression
+- One of:
+  - **Windows Defender** (`MpCmdRun.exe`) — used by `WindowsDefenderScanService` on Windows
+  - **ClamAV** (`clamd` listening on TCP) — used by `ClamAvScanService` on Linux / macOS / containers
 
 ---
 
@@ -173,7 +226,13 @@ Path traversal checks use a proper base-path check rather than `string.StartsWit
 ```csharp
 // Program.cs / Startup registration
 builder.Services.AddSingleton<FileContentValidator>();
-builder.Services.AddSingleton<IVirusScanService, WindowsDefenderScanService>();
+
+// Pick ONE virus scanner based on platform:
+if (OperatingSystem.IsWindows())
+    builder.Services.AddSingleton<IVirusScanService, WindowsDefenderScanService>();
+else
+    builder.Services.AddSingleton<IVirusScanService, ClamAvScanService>();
+
 builder.Services.AddSingleton<IFileUploadService, FileUploadService>();
 
 // Configure multipart body size limit to match your FileUpload:MaxTotalUploadBytes
@@ -212,8 +271,8 @@ public async Task<IActionResult> Submit(MyInputModel model)
 ## Docs
 
 - [`docs/threat-model.md`](docs/threat-model.md) — What attack each layer defeats
-- [`docs/pipeline-diagram.md`](docs/pipeline-diagram.md) — Detailed flow with edge cases
-- [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) — AI red-team adversarial findings
+- [`docs/hardening-roadmap.md`](docs/hardening-roadmap.md) — Recommendations to reach the strongest realistic posture
+- [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) — AI red-team adversarial findings (with current resolution status)
 - [`KNOWN-GAPS.md`](KNOWN-GAPS.md) — Honest limitations and what this does NOT protect against
 
 ---
@@ -227,6 +286,6 @@ MIT. Use freely. Attribution appreciated but not required.
 ## Contributing
 
 Issues and PRs welcome, especially:
-- ClamAV implementation of `IVirusScanService` (Linux/cross-platform alternative to Windows Defender)
 - Unit test coverage for the validation layers
 - Additional format validators (GIF, BMP deep content validation)
+- Async/queued virus-scan worker for high-volume deployments

@@ -23,7 +23,11 @@ The most significant finding is the **polyglot file gap**: a carefully crafted f
 
 ---
 
-### FINDING 1 — MEDIUM — WebP Verification Incomplete at Layer 4
+### FINDING 1 — ✅ RESOLVED — WebP Verification Incomplete at Layer 4
+
+> **Status (post-remediation):** Fixed. `ValidateFileSignatureDetailed` in `FileUploadService.cs` now checks the `WEBP` fourCC at offset 8 inline with the Layer 4 RIFF check, rather than deferring to Layer 6. AVI/WAV files renamed to `.webp` are now caught at Layer 4 directly.
+
+**Original finding (preserved for context):**
 
 **Location:** `FileUploadService.cs`, `FileSignatures` dictionary  
 **Code:**
@@ -53,7 +57,11 @@ private static bool IsValidWebpMagic(byte[] header)
 
 ---
 
-### FINDING 2 — MEDIUM — Polyglot Files Can Survive All 8 Layers
+### FINDING 2 — ✅ RESOLVED — Polyglot Files Can Survive All 8 Layers
+
+> **Status (post-remediation):** Mitigated by image recompression. `FileUploadService.GetSanitizedPlaintextAsync` decodes and re-encodes JPEG / PNG / WebP through ImageSharp before encryption (controlled by `FileUpload:RecompressImages`, default `true`). Any polyglot tail appended after the image's structural end is dropped by the encoder. Configurable JPEG quality via `FileUpload:JpegRecompressQuality` (default 95).
+
+**Original finding (preserved for context):**
 
 **Location:** Systemic — no single code location  
 **Technique:** JPEG polyglot with appended payload
@@ -83,9 +91,11 @@ See `KNOWN-GAPS.md` for why this was not implemented in the original codebase.
 
 ### FINDING 3 — LOW — Fixed PBKDF2 Application Salt
 
+> **Status:** Acknowledged. Now applies to the master KEK in the envelope-encryption (v2) scheme — per-file DEKs are random and never derived from the secret. Salt is `"SecureFileUpload.FileUpload.v1"`.
+
 **Location:** `FileUploadService.cs`, constructor
 ```csharp
-var salt = Encoding.UTF8.GetBytes("LcplOnlineRegistration.FileUpload.v1");
+var salt = Encoding.UTF8.GetBytes("SecureFileUpload.FileUpload.v1");
 _encryptionKey = Rfc2898DeriveBytes.Pbkdf2(
     Encoding.UTF8.GetBytes(secret), salt, iterations: 600_000, ...);
 ```
@@ -98,7 +108,11 @@ _encryptionKey = Rfc2898DeriveBytes.Pbkdf2(
 
 ---
 
-### FINDING 4 — LOW — Filename Logged Before Sanitization in FileUploadService
+### FINDING 4 — ✅ RESOLVED — Filename Logged Before Sanitization in FileUploadService
+
+> **Status (post-remediation):** Fixed. A new `SanitizeForLog` helper strips ANSI escape sequences, control characters, structured-log placeholders (`{`, `}`, `|`), CRLF, and Unicode bidi/zero-width characters; truncates to 128 chars. All log statements and user-facing error strings in `FileUploadService` that include `file.FileName` now route through `SanitizeForLog`. The unrelated `SanitizeFileName` helper (used to derive on-disk filenames) is kept separate.
+
+**Original finding (preserved for context):**
 
 **Location:** `FileUploadService.cs`, `UploadFilesAsync`
 ```csharp
@@ -159,7 +173,11 @@ result.Errors.Add($"File '{file.FileName}': {errorMessage}");
 
 ---
 
-### FINDING 7 — INFORMATIONAL — PDF Pattern Matching is Byte-Sequence Based
+### FINDING 7 — ✅ RESOLVED — PDF Pattern Matching is Byte-Sequence Based
+
+> **Status (post-remediation):** Fixed. `FileContentValidator.ScanCompressedPdfStreams` walks every `stream … endstream` block, attempts `DeflateStream` decompression (handles the optional 2-byte zlib header), and re-runs `DangerousPdfPatterns` and `JsTriggerPatterns` against the decompressed bytes. Bounded by `MaxCompressedStreamsToInspect` and `MaxDecompressedStreamBytes` to defeat zip-bomb amplification.
+
+**Original finding (preserved for context):**
 
 **Location:** `FileContentValidator.cs`, `DangerousPdfPatterns`
 ```csharp
@@ -210,15 +228,17 @@ These are not hedges — they are things this codebase does better than most pro
 | MIME spoofing | ✅ Yes | Layer 3 |
 | Magic byte forgery | ✅ Yes | Layer 4 |
 | PDF JavaScript | ✅ Yes (uncompressed) | Layer 6 |
-| PDF JavaScript (FlateDecode) | ⚠️ Partial | Layer 7 (AV may catch) |
-| PE executable embedded in JPEG tail | ⚠️ Partial | Layer 7 (AV may catch) |
-| Polyglot file (JPEG + PHP) | ⚠️ Partial | Layer 7 + encrypted storage |
-| WebP/RIFF format confusion | ⚠️ Partial | Layer 6 catches, Layer 4 misses |
+| PDF JavaScript (FlateDecode) | ✅ Yes | Layer 6 (`ScanCompressedPdfStreams`) + Layer 7 |
+| PE executable embedded in JPEG tail | ✅ Yes | Layer 8 image recompression strips tail |
+| Polyglot file (JPEG + PHP) | ✅ Yes | Layer 8 image recompression strips tail |
+| WebP/RIFF format confusion | ✅ Yes | Layer 4 fourCC check + Layer 6 |
 | Windows reserved names (NUL, COM1) | ✅ Yes | Layer 5 |
-| Log poisoning via filename | ⚠️ Partial | Only in FileContentValidator |
+| Log poisoning via filename | ✅ Yes | `SanitizeForLog` in FileUploadService |
 | Disk exhaustion | ✅ Yes | Layer 1 + capacity check |
-| Automated bot submission | ⚠️ Partial | Rate limiting (reCAPTCHA disabled) |
-| Encrypted PDF content hiding | ✅ Yes (rejected) | Layer 6 (RejectEncryptedPdfs) |
-| Temp file forensic recovery | ⚠️ Partial | Zero-overwrite (SSD caveat) |
+| Automated bot submission | ⚠️ Partial | Rate limiting (reCAPTCHA still recommended — see hardening roadmap) |
+| Encrypted PDF content hiding | ✅ Yes (rejected with friendly UX) | Layer 6 (RejectEncryptedPdfs) |
+| Temp file forensic recovery | ⚠️ Partial | Zero-overwrite (SSD caveat); ClamAV path avoids temp file entirely |
 | Direct web serving of uploads | ✅ Yes | Storage outside wwwroot |
 | Startup with bad config | ✅ Yes | Constructor guards |
+| Master key compromise (single-key blast radius) | ✅ Yes | Layer 8 envelope encryption (per-file DEK wrapped by KEK) |
+| Non-Windows deployment had no AV | ✅ Yes | `ClamAvScanService` (clamd `zINSTREAM`) |

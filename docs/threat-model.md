@@ -47,8 +47,8 @@ This document maps specific attack vectors to the pipeline layers that stop them
 - **Known dangerous format identification**: The `KnownDangerousSignatures` dictionary identifies what a rejected file *actually is* (ZIP, ELF, OLE document, PHP, shebang script) for audit logging — even when the dangerous file would be rejected anyway on extension grounds.
 
 **What this layer does NOT do:**
-- Does not verify the complete file structure — a JPEG header attached to arbitrary data passes this layer (caught at Layer 6).
-- WebP verification at this layer only checks `RIFF` at offset 0, not the `WEBP` fourCC at offset 8. This is caught at Layer 6. See `SECURITY-ANALYSIS.md` Finding 1.
+- Does not verify the complete file structure — a JPEG header attached to arbitrary data passes this layer (caught at Layer 6 — and the trailing data is then stripped by image recompression in Layer 8 when enabled).
+- WebP verification at this layer checks `RIFF` at offset 0 **and** the `WEBP` fourCC at offset 8. RIFF-format AVI/WAV files renamed to `.webp` are caught here directly.
 
 ---
 
@@ -89,29 +89,34 @@ This is the most complex and most powerful layer. It does format-specific struct
 - **Embedded files** (`/EmbeddedFile`): Hard-rejected. Patron documents should not contain embedded files.
 - **Rich media / XFA / 3D** (`/RichMedia`, `/XFA`, `/3D`): Hard-rejected.
 - **JBIG2Decode**: Hard-rejected. JBIG2Decode has been used in exploit chains.
-- **Encrypted PDFs**: Rejected when `RejectEncryptedPdfs: true` (default). Encrypted PDFs cannot be inspected, so we reject them.
+- **Encrypted PDFs**: Rejected when `RejectEncryptedPdfs: true` (default). Encrypted PDFs cannot be inspected, so we reject them — with a friendly user-facing message instructing patrons to upload an unprotected copy.
 - **Suspicious but conditional patterns** (`/URI`, `/OpenAction`, `/AcroForm`, `/SubmitForm`): Logged as suspicious; `/OpenAction` and `/AA` are hard-rejected when JavaScript is also present.
+- **Threat tokens hidden in `FlateDecode`-compressed object streams**: `ScanCompressedPdfStreams` walks every `stream … endstream` block, decompresses with `DeflateStream`, and re-runs the dangerous-pattern scan against the decompressed bytes. Bounded by `MaxCompressedStreamsToInspect` and `MaxDecompressedStreamBytes` (zip-bomb safe).
 
 **Type mismatch attacks defeated:**
 - **Any file whose actual signature doesn't match its claimed extension**: The validator classifies the actual type from magic bytes first. If a file claims `.pdf` but has JPEG magic bytes, it's a type mismatch rejection (distinct disposition from a structural or malicious rejection).
 
 **What this layer does NOT do:**
-- Does not inspect compressed PDF stream contents (FlateDecode). See `KNOWN-GAPS.md`.
-- Does not strip polyglot payloads from JPEG tails. See `KNOWN-GAPS.md`.
+- Does not catch novel format confusions in unsupported types (validator is allowlist-based).
+- Polyglot tails are not removed here — they are stripped by the image recompression step in Layer 8 instead.
 
 ---
 
 ## Layer 7 — Virus Scan (IVirusScanService)
 
+**Implementations available:**
+- `WindowsDefenderScanService` — invokes `MpCmdRun.exe`. Windows-only. Writes a temp file (zeroed before delete).
+- `ClamAvScanService` — talks to `clamd` directly over TCP using the documented `zINSTREAM` protocol. Cross-platform. **No temp file is written** — patron bytes never touch disk on the scanner path.
+
 **Attacks defeated:**
-- **Known malware signatures**: Windows Defender and ClamAV both maintain frequently-updated signature databases covering thousands of known malware families, including many polyglot and steganographic attack tools.
-- **Known malicious PDF patterns**: AV engines inspect PDF content including decompressed streams, compensating for the Layer 6 FlateDecode gap.
-- **Polymorphic variants of known malware**: Heuristic scanning in Windows Defender catches some zero-day variants.
+- **Known malware signatures**: Both Windows Defender and ClamAV maintain frequently-updated signature databases covering thousands of known malware families, including many polyglot and steganographic attack tools.
+- **Known malicious PDF patterns**: AV engines inspect PDF content including decompressed streams — a defence-in-depth complement to Layer 6's own `ScanCompressedPdfStreams`.
+- **Polymorphic variants of known malware**: Heuristic scanning catches some zero-day variants.
 
 **What this layer does NOT do:**
 - Does not catch unknown (zero-day) malware with no signature match.
-- Is not effective if disabled (`VirusScan:Enabled: false`). When disabled, this layer returns `NotScanned` and the file is accepted by the scan outcome switch — the other 7 layers still apply.
-- The scanner is fail-closed: if `MpCmdRun.exe` is unavailable, the file is rejected. This prevents a misconfigured server from silently skipping scans.
+- Is not effective if disabled (`VirusScan:Enabled: false`). When disabled, this layer returns `NotScanned` and the file is accepted — the other 7 layers still apply.
+- The scan is fail-closed on **detection** but fail-open on **availability**: a clear malware signature blocks the upload, while a transient scanner failure (timeout, daemon down) marks the file as `NotScanned` rather than rejecting it. This is intentional — the file already passed all six prior validation layers.
 
 ---
 
@@ -123,7 +128,9 @@ This is the most complex and most powerful layer. It does format-specific struct
 - **Storage content disclosure**: AES-256-GCM authenticated encryption means uploaded patron documents (IDs, utility bills) are not readable even if an attacker gains filesystem access.
 - **Filename enumeration**: Randomized filenames (`{lastName}{date}{formType}Doc{n}{randomSuffix}.ext`) remove attacker control over stored filenames and prevent sequential enumeration.
 - **Encrypted file tampering**: GCM authentication tags detect any modification to encrypted file contents. A tampered file will fail decryption and be rejected.
+- **Polyglot tails after image EOI**: When `RecompressImages=true` (default), JPEG / PNG / WebP files are re-encoded through ImageSharp before encryption. The encoder emits only the bytes it produces, so any data appended after the image's structural end is dropped.
+- **Single-key blast radius**: Files are stored using **envelope encryption (format v2)** — a per-file random Data Encryption Key (DEK) encrypts the payload, and the DEK itself is wrapped under the master Key Encryption Key (KEK). The master key can be rotated by re-wrapping each file's DEK without re-encrypting the file payload.
 
 **What this layer does NOT do:**
 - Encryption is optional (`EncryptionEnabled: false` by default). When disabled, files are stored in plaintext — all other layers still apply, but stored files are readable if an attacker accesses the filesystem.
-- Does not protect against key compromise. If `EncryptionSecret` is obtained, all stored files can be decrypted. See `KNOWN-GAPS.md` Gap 3 on secret management.
+- Does not protect against KEK compromise. If `EncryptionSecret` is obtained, all wrapped DEKs (and therefore all stored files) can be decrypted. See `KNOWN-GAPS.md` and `docs/hardening-roadmap.md` on KMS / HSM integration.
