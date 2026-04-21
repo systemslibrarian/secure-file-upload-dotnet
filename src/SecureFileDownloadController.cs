@@ -137,16 +137,28 @@ namespace SecureFileUpload.Services
             // If a viewer UI is needed, it must explicitly fetch the file, perform its
             // own type-safe rendering (e.g. server-side rasterisation), and never expose
             // a URL that returns the decrypted bytes with a renderable Content-Type.
-            ApplyHardenedResponseHeaders();
+            //
+            // Wrapped in try/catch: anything that throws between successful decrypt
+            // and handing the stream to File(...) must dispose the stream, otherwise
+            // the file handle and the plaintext buffer leak.
+            try
+            {
+                ApplyHardenedResponseHeaders();
 
-            // RFC 6266 attachment with a UTF-8 safe filename. The original on-disk
-            // filename is already randomized (`{lastName}{date}{form}Doc{n}{rand}.ext`)
-            // so it carries no attacker input — but we still encode it correctly to
-            // defend against any future caller that passes through a less-clean name.
-            var downloadName = Path.GetFileName(fullPath);
-            var cd = new ContentDispositionHeaderValue("attachment");
-            cd.SetHttpFileName(downloadName);
-            Response.Headers[HeaderNames.ContentDisposition] = cd.ToString();
+                // RFC 6266 attachment with a UTF-8 safe filename. The original on-disk
+                // filename is already randomized (`{lastName}{date}{form}Doc{n}{rand}.ext`)
+                // so it carries no attacker input — but we still encode it correctly to
+                // defend against any future caller that passes through a less-clean name.
+                var downloadName = Path.GetFileName(fullPath);
+                var cd = new ContentDispositionHeaderValue("attachment");
+                cd.SetHttpFileName(downloadName);
+                Response.Headers[HeaderNames.ContentDisposition] = cd.ToString();
+            }
+            catch
+            {
+                stream.Dispose();
+                throw;
+            }
 
             return File(stream, "application/octet-stream", enableRangeProcessing: false);
         }

@@ -6,10 +6,18 @@ A coverage-guided fuzz harness for `FileContentValidator.ValidateAsync` using
 The goal is **not** to find crashes in malicious files (we want those rejected).
 The goal is to find inputs that make the validator:
 
-1. **Throw an unhandled exception** instead of returning a `ContentValidationResult` — that's a fail-open hole because the caller in `FileUploadService` would treat it as a server error.
-2. **Hang or run unbounded** — DoS surface.
-3. **Allocate unbounded memory** — DoS surface.
-4. **Return `IsValid = true` for a known-malicious input class** in the seed corpus.
+1. **Hang or run unbounded** — DoS surface. AFL flags any input that exceeds
+   the `-t` per-execution timeout.
+2. **Allocate unbounded memory** — DoS surface. AFL flags any input that
+   exceeds the `-m` memory cap (run with `-m 512` or similar).
+3. **Leak an `OperationCanceledException`** out of `ValidateAsync` — the only
+   exception type the validator re-throws. We don't pass a cancellation token,
+   so this should never fire; if AFL records it, that's a real bug.
+4. **Return `IsValid = true` for a known-malicious input class** in the seed
+   corpus. ⚠️ AFL alone cannot detect this: `ValidateAsync` catches every
+   internal exception and converts it to `RejectStructural`. To find this
+   class of bug, replay each crash file in single-file mode (see Triage
+   below) and assert the printed `Disposition` is not `Allowed`.
 
 Anything in those four categories is a real bug.
 

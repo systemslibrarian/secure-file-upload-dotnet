@@ -13,15 +13,22 @@ namespace SecureFileUpload.Fuzz;
 ///   1. AFL persistent: `Fuzzer.OutOfProcess.Run(Fuzz)` — stdin loop driven by afl-fuzz.
 ///      Used when launched from `afl-fuzz -i seeds -o findings -- ./FuzzHarness @@`.
 ///   2. Single-file replay: `FuzzHarness path/to/crash` — re-runs one input
-///      directly, surfacing any unhandled exception with full .NET stack trace.
-///      Used during triage from `findings/default/crashes/`.
+///      directly. Prints the ContentValidationResult or any exception that
+///      escaped, with full .NET stack trace. Used during triage from
+///      `findings/default/crashes/` and `findings/default/hangs/`.
 ///
-/// Bug definition (anything matching is a finding):
-///   * Unhandled exception that escapes ValidateAsync.
-///   * Hang or runaway allocation (AFL detects these out-of-band).
-///   * ValidateAsync returns IsValid=true for an input the caller should reject —
-///     not detectable from this harness alone; verified by inspecting the
-///     ContentValidationResult returned for known-bad seeds.
+/// What this harness can find:
+///   * Hangs / pathological CPU — AFL flags inputs that exceed `-t` timeout.
+///   * Runaway allocation / OOM — AFL flags inputs that exceed `-m` memory cap.
+///   * OperationCanceledException leaks — only exception type ValidateAsync
+///     re-throws (everything else is caught and converted to RejectStructural).
+///   * False-clean results — out of band: re-run known-bad seeds in replay
+///     mode and assert the printed Disposition is not `Allowed`.
+///
+/// What this harness CANNOT find directly:
+///   * Logic bugs that produce IsValid=true for malicious input — ValidateAsync
+///     swallows internal exceptions, so you must check the returned result.
+///     Use replay mode + a curated bad-seed corpus for this class of bug.
 /// </summary>
 public static class Program
 {
@@ -55,18 +62,13 @@ public static class Program
             stream.CopyTo(ms);
             byte[] bytes = ms.ToArray();
 
-            // Catch & swallow expected validator errors so AFL doesn't classify
-            // ordinary "rejected file" outcomes as crashes. Anything we don't
-            // expect here is a real bug — let it propagate so AFL records it.
-            try
-            {
-                _ = RunOnce(bytes, fileName: "fuzz.bin");
-            }
-            catch (InvalidOperationException)
-            {
-                // ValidateAsync uses this for "deep scan size limit exceeded" —
-                // intentional fail-closed signal, not a bug.
-            }
+            // ValidateAsync catches all internal exceptions and converts them
+            // to a RejectStructural result, so the only exception type that
+            // can escape is OperationCanceledException (we don't pass a token,
+            // so this should never fire either). We deliberately do NOT wrap
+            // RunOnce in a catch — anything that escapes IS a real finding
+            // and AFL must record it.
+            _ = RunOnce(bytes, fileName: "fuzz.bin");
         });
 
         return 0;

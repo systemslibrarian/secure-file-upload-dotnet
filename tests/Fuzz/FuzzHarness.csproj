@@ -16,20 +16,31 @@
     <TieredCompilation>false</TieredCompilation>
   </PropertyGroup>
 
+  <!--
+    FileContentValidator depends on IFormFile (Microsoft.AspNetCore.Http) and
+    is hosted inside an ASP.NET Core app, so we pull in the ASP.NET Core
+    shared framework. Without this reference IFormFile / FormFile do not
+    resolve and the harness will not build.
+  -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="SharpFuzz" Version="2.1.1" />
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="8.0.0" />
   </ItemGroup>
 
   <!--
-    Adjust this to point at the project that contains FileContentValidator.
-    The deep validator is currently distributed as loose source files in /src,
-    so consumers will typically have it inside their own ASP.NET Core project.
-    Replace the <Compile Include> lines below with a <ProjectReference> if you
-    move the validator into a class library.
+    The deep validator is distributed as loose source files in /src, so we
+    pull it in directly via <Compile Include>. Replace with a
+    <ProjectReference> if you move the validator into a class library.
+    Forward slashes work cross-platform; MSBuild normalises separators.
   -->
   <ItemGroup>
-    <Compile Include="..\..\src\FileContentValidator.cs" Link="FileContentValidator.cs" />
+    <Compile Include="../../src/FileContentValidator.cs" Link="FileContentValidator.cs" />
   </ItemGroup>
 
 </Project>
