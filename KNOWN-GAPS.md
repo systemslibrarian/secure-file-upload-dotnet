@@ -6,7 +6,16 @@ This document exists because intellectual honesty matters more than looking good
 
 ---
 
-## Gap 1: Polyglot Files Are Not Fully Eliminated
+## Gap 1: Polyglot Files Are Not Fully Eliminated  ✅ FIXED (opt-in)
+
+> **Status:** Mitigated. Image recompression is now implemented in `FileUploadService.GetSanitizedPlaintextAsync`. JPEG / PNG / WebP uploads are decoded and re-encoded with ImageSharp before encryption, which strips any data appended after the image's logical end (the polyglot vector).
+>
+> **Configuration:**
+> - `FileUpload:RecompressImages` (default `true`) — set `false` to keep original bytes if quality is critical.
+> - `FileUpload:JpegRecompressQuality` (default `95`, clamped 1–100) — JPEG output quality.
+>
+> The historical rationale below is retained for context.
+
 
 **What it means:** A file can simultaneously be a valid JPEG (passes all validation) and contain an embedded executable, script, or payload in the tail bytes after the JPEG EOI marker. The validation pipeline detects the file as structurally valid JPEG. The virus scanner may or may not catch the payload depending on signature coverage.
 
@@ -21,7 +30,17 @@ This document exists because intellectual honesty matters more than looking good
 
 ---
 
-## Gap 2: PDF FlateDecode Stream Contents Are Not Inspected
+## Gap 2: PDF FlateDecode Stream Contents Are Not Inspected  ✅ FIXED
+
+> **Status:** Mitigated. `FileContentValidator.ScanCompressedPdfStreams` now walks every `stream … endstream` block, FlateDecodes it via `System.IO.Compression.DeflateStream`, and re-runs `DangerousPdfPatterns` / `JsTriggerPatterns` against the decompressed bytes. No PDF parsing dependency added.
+>
+> **Bounded by config (zip-bomb safe):**
+> - `FileContent:InspectCompressedPdfStreams` (default `true`)
+> - `FileContent:MaxCompressedStreamsToInspect` (default `64`)
+> - `FileContent:MaxDecompressedStreamBytes` (default `16 MiB`)
+>
+> Malformed streams are silently skipped (fail-open per stream); pattern hits in any decompressed stream cause the whole file to be rejected (fail-closed per file).
+
 
 **What it means:** The PDF pattern scanner searches for dangerous PDF object names (`/JS`, `/JavaScript`, `/Launch`, etc.) in the raw file bytes. PDF streams are often compressed using `FlateDecode` (zlib/deflate). Dangerous patterns inside compressed streams will not be found by string matching on the raw bytes.
 
@@ -43,7 +62,14 @@ This document exists because intellectual honesty matters more than looking good
 
 ---
 
-## Gap 4: Encrypted PDF Files Are Rejected Entirely
+## Gap 4: Encrypted PDF Files Are Rejected Entirely  ✅ FIXED (UX)
+
+> **Status:** Improved. The pipeline still rejects encrypted PDFs (correct fail-closed posture), but `FileUploadService` now surfaces a specific user-facing message when `ContentValidationResult.ValidationType == "PDF-EncryptedRejected"`:
+>
+> > *"Password-protected PDFs cannot be accepted because their contents cannot be inspected for safety. Please upload an unprotected copy of this document."*
+>
+> Patrons no longer see a generic rejection.
+
 
 **What it means:** `RejectEncryptedPdfs: true` (the default) means patron-submitted PDFs that are encrypted/password-protected are rejected outright, even if they contain no malicious content.
 
@@ -65,7 +91,20 @@ This document exists because intellectual honesty matters more than looking good
 
 ---
 
-## Gap 6: Windows Defender Only — No Linux/Cross-Platform AV Support
+## Gap 6: Windows Defender Only — No Linux/Cross-Platform AV Support  ✅ FIXED
+
+> **Status:** Mitigated. `src/ClamAvScanService.cs` provides a cross-platform `IVirusScanService` implementation that talks to `clamd` directly over TCP using the documented `zINSTREAM` protocol — no temp file is written and patron bytes never touch disk.
+>
+> **Configuration (`VirusScan:ClamAv:*`):**
+> - `Host` (default `localhost`)
+> - `Port` (default `3310`)
+> - `TimeoutSeconds` (default `30`, max `120`)
+> - `MaxStreamBytes` (default `25 MiB`; must align with `clamd.conf` `StreamMaxLength`)
+>
+> Fail-closed: any timeout, socket error, or unrecognised response yields `IsClean=false, ScanSuccessful=false`. Health check uses `nPING` (no state mutation).
+>
+> Register one or the other in DI based on platform — `WindowsDefenderScanService` for Windows, `ClamAvScanService` for Linux/containers/macOS.
+
 
 **What it means:** `WindowsDefenderScanService` requires `MpCmdRun.exe` and therefore requires a Windows server. There is no provided ClamAV implementation for Linux deployments.
 
@@ -86,7 +125,19 @@ This document exists because intellectual honesty matters more than looking good
 
 ---
 
-## Gap 8: Single Encryption Key for All Files
+## Gap 8: Single Encryption Key for All Files  ✅ FIXED
+
+> **Status:** Mitigated. `FileUploadService` now writes envelope-encrypted files (`FormatVersionV2 = 0x02`):
+>
+> 1. Generate a random 256-bit Data Encryption Key (DEK) per file.
+> 2. Encrypt the file payload with the DEK using AES-256-GCM.
+> 3. Wrap (encrypt) the DEK itself with the master Key Encryption Key (KEK) using a separate AES-256-GCM operation.
+> 4. Store on disk as: `marker || dek_nonce || dek_tag || wrapped_dek || file_nonce || file_tag || ciphertext`.
+>
+> **Backward-compatible reads:** `GetDecryptedFileStreamAsync` dispatches on the version byte, so legacy `0x01` single-key files continue to decrypt via `DecryptV1SingleKey`. Unsupported versions are logged and refused.
+>
+> **Key rotation** is now possible by rewrapping each file's DEK under a new KEK — no need to re-encrypt the file payload itself. `TryUnwrapDek` already supports a master + legacy KEK fallback to make that migration online-safe.
+
 
 **What it means:** All uploaded files share a single derived master key. Key rotation requires re-encrypting all stored files. There is no per-file key or key versioning system.
 

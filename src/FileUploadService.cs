@@ -3,6 +3,10 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using SecureFileUpload.Utilities;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats.Jpeg;
+using SixLabors.ImageSharp.Formats.Png;
+using SixLabors.ImageSharp.Formats.Webp;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -102,20 +106,38 @@ namespace SecureFileUpload.Services
         private readonly long _minTempFreeBytes;
         private readonly long _lowDiskWarningBytes;
         private readonly bool _encryptionEnabled;
-        private readonly byte[]? _encryptionKey;       // 32-byte AES-256 key (PBKDF2-derived)
+        private readonly byte[]? _encryptionKey;       // 32-byte AES-256 master/KEK (PBKDF2-derived)
         private readonly byte[]? _legacyEncryptionKey; // Optional fallback key for legacy PBKDF2 iteration counts
         private readonly bool _virusScanEnabled;       // mirrors VirusScan:Enabled in appsettings
+        private readonly bool _recompressImages;       // Gap 1 mitigation — strips polyglot tails on write
+        private readonly int _jpegRecompressQuality;   // 1–100, default 95
 
         // ── AES-256-GCM file format constants ────────────────────────────
         //
-        // Marker written at the start of every AES-GCM encrypted file.
-        // Layout: [8 marker][12 nonce][16 tag][ciphertext]
-        private static readonly byte[] GcmEncryptedFileMarker = Encoding.ASCII.GetBytes("ENCGCM\0\x01");
+        // Two on-disk formats are supported:
+        //
+        //   v1 (legacy, single key):
+        //     [8 marker "ENCGCM\0\x01"][12 nonce][16 tag][ciphertext]
+        //     Encrypted directly under the master key. Decrypt-only — no longer written.
+        //
+        //   v2 (envelope encryption — Gap 8 mitigation):
+        //     [8 marker "ENCGCM\0\x02"]
+        //     [12 dek_nonce][16 dek_tag][32 wrapped_dek]      ← wrapped under master key
+        //     [12 file_nonce][16 file_tag][ciphertext]        ← encrypted with random per-file DEK
+        //     Each file gets a unique 256-bit Data Encryption Key (DEK).
+        //     The DEK is encrypted (wrapped) with the master Key Encryption Key (KEK).
+        //     This enables KEK rotation by rewrapping only the DEKs — no re-encryption of file payloads.
+        //
+        private static readonly byte[] GcmEncryptedFileMarkerV1 = Encoding.ASCII.GetBytes("ENCGCM\0\x01");
+        private static readonly byte[] GcmEncryptedFileMarkerV2 = Encoding.ASCII.GetBytes("ENCGCM\0\x02");
         private static readonly byte[] GcmFormatPrefix = { 0x45, 0x4E, 0x43, 0x47, 0x43, 0x4D, 0x00 }; // "ENCGCM\0"
-        private const byte SupportedGcmFormatVersion = 0x01;
+        private const byte FormatVersionV1 = 0x01;
+        private const byte FormatVersionV2 = 0x02;
         private const int GcmNonceSize  = 12;  // 96-bit nonce — GCM standard recommendation
         private const int GcmTagSize    = 16;  // 128-bit authentication tag
-        private const int GcmHeaderSize = 8 + GcmNonceSize + GcmTagSize; // marker + nonce + tag
+        private const int DekSize       = 32;  // 256-bit per-file Data Encryption Key
+        private const int GcmV1HeaderSize = 8 + GcmNonceSize + GcmTagSize;                         // 36
+        private const int GcmV2HeaderSize = 8 + GcmNonceSize + GcmTagSize + DekSize + GcmNonceSize + GcmTagSize; // 96
 
         // ── Allowlists ───────────────────────────────────────────────────
 
@@ -280,6 +302,14 @@ namespace SecureFileUpload.Services
 
             _virusScanEnabled = _configuration.GetValue<bool>("VirusScan:Enabled", false);
 
+            // Gap 1 mitigation: re-encode JPEG/PNG/WebP after validation but before write.
+            // Decoding then re-encoding through ImageSharp strips any data appended after
+            // the image's structural end (polyglot tails, embedded executables, scripts).
+            // Default: enabled. Disable only if you must preserve byte-exact original images.
+            _recompressImages = _configuration.GetValue<bool>("FileUpload:RecompressImages", true);
+            _jpegRecompressQuality = Math.Clamp(
+                _configuration.GetValue<int>("FileUpload:JpegRecompressQuality", 95), 1, 100);
+
             _encryptionEnabled = _configuration.GetValue<bool>("FileUpload:EncryptionEnabled", false);
             if (_encryptionEnabled)
             {
@@ -328,10 +358,11 @@ namespace SecureFileUpload.Services
             _logger.LogInformation(
                 "FileUploadService initialized | StorageRoot: {Path} | MaxSize: {Size}MB | MaxCount: {Count} | MaxTotal: {TotalMB}MB | " +
                 "MinStorageFree: {MinStorageMB}MB | MinTempFree: {MinTempMB}MB | LowDiskWarn: {WarnMB}MB | " +
-                "Encryption: {Enc} | DeepValidation: enabled | VirusScan: {VS} ({Scanner})",
+                "Encryption: {Enc} | Recompress: {RC} | DeepValidation: enabled | VirusScan: {VS} ({Scanner})",
                 _storageRoot, _maxFileSizeBytes / 1024 / 1024, _maxFileCount, _maxTotalUploadBytes / 1024 / 1024,
                 _minStorageFreeBytes / 1024 / 1024, _minTempFreeBytes / 1024 / 1024, _lowDiskWarningBytes / 1024 / 1024,
-                _encryptionEnabled ? "AES-256-GCM" : "disabled",
+                _encryptionEnabled ? "AES-256-GCM (envelope/v2)" : "disabled",
+                _recompressImages ? $"enabled (JPEG q={_jpegRecompressQuality})" : "disabled",
                 _virusScanEnabled ? "enabled" : "disabled",
                 _virusScanService.ScannerName);
         }
@@ -460,8 +491,16 @@ namespace SecureFileUpload.Services
                         _logger.LogWarning(
                             "SECURITY_EVENT | DEEP_VALIDATION_FAILED | Type: {Type} | Threat: {Threat} | Form: {FormType}",
                             contentResult.ValidationType, contentResult.ThreatDescription ?? "n/a", formType);
-                        // Return a generic message to the user — don't leak internal details
-                        result.Errors.Add($"File '{file.FileName}': File failed validation.");
+
+                        // Gap 4 mitigation: surface a specific, actionable message for
+                        // encrypted PDFs so patrons aren't left guessing why an unprotected
+                        // re-save would have worked. All other validation failures still
+                        // return a generic message to avoid leaking internal detection logic.
+                        string userMessage = contentResult.ValidationType == "PDF-EncryptedRejected"
+                            ? "Password-protected PDFs cannot be accepted because their contents cannot be inspected for safety. Please upload an unprotected copy of this document."
+                            : "File failed validation.";
+
+                        result.Errors.Add($"File '{file.FileName}': {userMessage}");
                         continue;
                     }
 
@@ -650,12 +689,11 @@ namespace SecureFileUpload.Services
 
         /// <summary>
         /// Returns a decrypted MemoryStream for staff file viewing.
-        /// Detects AES-256-GCM encrypted files via the ENCGCM marker;
-        /// unencrypted files are served as-is.
+        /// Detects encrypted files via the ENCGCM marker and dispatches by version:
+        ///   v0x01 — single-key AES-GCM (legacy, decrypt-only)
+        ///   v0x02 — envelope encryption: unwrap DEK with master KEK, then decrypt payload
+        /// Unencrypted files are served as-is.
         /// Caller must dispose the returned stream.
-        ///
-        /// Uses Span-based slicing to avoid intermediate array allocations
-        /// on the decryption hot path.
         /// </summary>
         public async Task<(Stream? Stream, string ContentType)> GetDecryptedFileStreamAsync(string filePath)
         {
@@ -671,77 +709,153 @@ namespace SecureFileUpload.Services
             {
                 var rawBytes = await File.ReadAllBytesAsync(filePath);
 
-                // Check for the GCM format prefix (ENCGCM\0) to detect versioned encrypted files
+                // Detect ENCGCM\0 prefix and dispatch by version byte.
                 if (rawBytes.Length >= GcmFormatPrefix.Length + 1 &&
                     rawBytes.AsSpan(0, GcmFormatPrefix.Length).SequenceEqual(GcmFormatPrefix))
                 {
-                    var version = rawBytes[GcmFormatPrefix.Length];
-                    if (version != SupportedGcmFormatVersion)
-                    {
-                        _logger.LogWarning(
-                            "FILE_DECRYPT_UNSUPPORTED_VERSION | Path: {Path} | Version: 0x{Version:X2} | Supported: 0x{Supported:X2}",
-                            filePath, version, SupportedGcmFormatVersion);
-                        return (null, contentType);
-                    }
-                }
-
-                // Full GCM detection: marker (8) + nonce (12) + tag (16) + at least 0 bytes ciphertext
-                bool isGcmEncrypted = rawBytes.Length >= GcmHeaderSize &&
-                    rawBytes.AsSpan(0, GcmEncryptedFileMarker.Length).SequenceEqual(GcmEncryptedFileMarker);
-
-                if (isGcmEncrypted)
-                {
                     if (_encryptionKey == null)
                     {
-                        _logger.LogError("FILE_DECRYPT_NO_KEY | GCM file encrypted but no key configured. Path: {Path}", filePath);
+                        _logger.LogError("FILE_DECRYPT_NO_KEY | Encrypted file but no key configured. Path: {Path}", filePath);
                         return (null, contentType);
                     }
 
-                    // Extract nonce, tag, and ciphertext using Span slicing — zero intermediate allocations.
-                    int offset = GcmEncryptedFileMarker.Length;
-                    var nonce      = rawBytes.AsSpan(offset, GcmNonceSize).ToArray();
-                    offset += GcmNonceSize;
-                    var tag        = rawBytes.AsSpan(offset, GcmTagSize).ToArray();
-                    offset += GcmTagSize;
-                    var ciphertext = rawBytes.AsSpan(offset).ToArray();
-
-                    byte[]? plaintext = TryDecryptGcm(ciphertext, nonce, tag, _encryptionKey);
-                    if (plaintext == null && _legacyEncryptionKey != null)
+                    var version = rawBytes[GcmFormatPrefix.Length];
+                    return version switch
                     {
-                        plaintext = TryDecryptGcm(ciphertext, nonce, tag, _legacyEncryptionKey);
-                        if (plaintext != null)
-                        {
-                            _logger.LogInformation(
-                                "FILE_DECRYPT_SUCCESS | GCM-LEGACY-KEY | {Path} ({Bytes:N0} plain bytes)",
-                                filePath, plaintext.Length);
-                        }
-                    }
-
-                    if (plaintext == null)
-                    {
-                        _logger.LogError(
-                            "FILE_DECRYPT_ERROR | Authentication failed for all configured keys. Path: {Path}",
-                            filePath);
-                        return (null, contentType);
-                    }
-
-                    var plainMs = new MemoryStream(plaintext);
-                    _logger.LogInformation(
-                        "FILE_DECRYPT_SUCCESS | GCM | {Path} ({Bytes:N0} plain bytes)",
-                        filePath, plaintext.Length);
-                    return (plainMs, contentType);
+                        FormatVersionV2 => DecryptV2Envelope(rawBytes, filePath, contentType),
+                        FormatVersionV1 => DecryptV1SingleKey(rawBytes, filePath, contentType),
+                        _ => LogUnsupportedVersion(filePath, version, contentType),
+                    };
                 }
-                else
-                {
-                    _logger.LogInformation(
-                        "FILE_DECRYPT_LEGACY | Serving legacy unencrypted file {Path}", filePath);
-                    return (new MemoryStream(rawBytes), contentType);
-                }
+
+                _logger.LogInformation(
+                    "FILE_DECRYPT_LEGACY | Serving legacy unencrypted file {Path}", filePath);
+                return (new MemoryStream(rawBytes), contentType);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "FILE_DECRYPT_ERROR | Failed to read/decrypt {Path}", filePath);
                 return (null, contentType);
+            }
+        }
+
+        private (Stream? Stream, string ContentType) LogUnsupportedVersion(string filePath, byte version, string contentType)
+        {
+            _logger.LogWarning(
+                "FILE_DECRYPT_UNSUPPORTED_VERSION | Path: {Path} | Version: 0x{Version:X2}",
+                filePath, version);
+            return (null, contentType);
+        }
+
+        /// <summary>
+        /// Decrypts a v2 envelope-encrypted file: unwraps the per-file DEK with the master KEK,
+        /// then decrypts the payload with the DEK. The DEK is zeroed before returning.
+        /// </summary>
+        private (Stream? Stream, string ContentType) DecryptV2Envelope(byte[] rawBytes, string filePath, string contentType)
+        {
+            if (rawBytes.Length < GcmV2HeaderSize)
+            {
+                _logger.LogError("FILE_DECRYPT_TRUNCATED | v2 envelope file too short. Path: {Path}", filePath);
+                return (null, contentType);
+            }
+
+            int offset = GcmEncryptedFileMarkerV2.Length; // 8
+            var dekNonce   = rawBytes.AsSpan(offset, GcmNonceSize).ToArray();   offset += GcmNonceSize;
+            var dekTag     = rawBytes.AsSpan(offset, GcmTagSize).ToArray();     offset += GcmTagSize;
+            var wrappedDek = rawBytes.AsSpan(offset, DekSize).ToArray();        offset += DekSize;
+            var fileNonce  = rawBytes.AsSpan(offset, GcmNonceSize).ToArray();   offset += GcmNonceSize;
+            var fileTag    = rawBytes.AsSpan(offset, GcmTagSize).ToArray();     offset += GcmTagSize;
+            var ciphertext = rawBytes.AsSpan(offset).ToArray();
+
+            byte[]? dek = TryUnwrapDek(wrappedDek, dekNonce, dekTag, _encryptionKey!);
+            if (dek == null && _legacyEncryptionKey != null)
+            {
+                dek = TryUnwrapDek(wrappedDek, dekNonce, dekTag, _legacyEncryptionKey);
+                if (dek != null)
+                    _logger.LogInformation("FILE_DECRYPT_KEK_LEGACY | DEK unwrapped with legacy KEK. Path: {Path}", filePath);
+            }
+
+            if (dek == null)
+            {
+                _logger.LogError(
+                    "FILE_DECRYPT_KEK_FAIL | DEK unwrap failed for all configured master keys. Path: {Path}",
+                    filePath);
+                return (null, contentType);
+            }
+
+            try
+            {
+                byte[]? plaintext = TryDecryptGcm(ciphertext, fileNonce, fileTag, dek);
+                if (plaintext == null)
+                {
+                    _logger.LogError(
+                        "FILE_DECRYPT_PAYLOAD_FAIL | DEK valid but payload authentication failed. Path: {Path}",
+                        filePath);
+                    return (null, contentType);
+                }
+
+                _logger.LogInformation(
+                    "FILE_DECRYPT_SUCCESS | GCM-v2-Envelope | {Path} ({Bytes:N0} plain bytes)",
+                    filePath, plaintext.Length);
+                return (new MemoryStream(plaintext), contentType);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(dek);
+            }
+        }
+
+        /// <summary>
+        /// Decrypts a v1 single-key AES-GCM file. Kept for backward compatibility with
+        /// files written before envelope encryption was introduced.
+        /// </summary>
+        private (Stream? Stream, string ContentType) DecryptV1SingleKey(byte[] rawBytes, string filePath, string contentType)
+        {
+            if (rawBytes.Length < GcmV1HeaderSize)
+            {
+                _logger.LogError("FILE_DECRYPT_TRUNCATED | v1 file too short. Path: {Path}", filePath);
+                return (null, contentType);
+            }
+
+            int offset = GcmEncryptedFileMarkerV1.Length; // 8
+            var nonce      = rawBytes.AsSpan(offset, GcmNonceSize).ToArray();   offset += GcmNonceSize;
+            var tag        = rawBytes.AsSpan(offset, GcmTagSize).ToArray();     offset += GcmTagSize;
+            var ciphertext = rawBytes.AsSpan(offset).ToArray();
+
+            byte[]? plaintext = TryDecryptGcm(ciphertext, nonce, tag, _encryptionKey!);
+            string keyUsed = "current";
+            if (plaintext == null && _legacyEncryptionKey != null)
+            {
+                plaintext = TryDecryptGcm(ciphertext, nonce, tag, _legacyEncryptionKey);
+                keyUsed = "legacy";
+            }
+
+            if (plaintext == null)
+            {
+                _logger.LogError(
+                    "FILE_DECRYPT_ERROR | v1 authentication failed for all configured keys. Path: {Path}",
+                    filePath);
+                return (null, contentType);
+            }
+
+            _logger.LogInformation(
+                "FILE_DECRYPT_SUCCESS | GCM-v1 ({KeyUsed}) | {Path} ({Bytes:N0} plain bytes)",
+                keyUsed, filePath, plaintext.Length);
+            return (new MemoryStream(plaintext), contentType);
+        }
+
+        private static byte[]? TryUnwrapDek(byte[] wrappedDek, byte[] dekNonce, byte[] dekTag, byte[] kek)
+        {
+            try
+            {
+                var dek = new byte[wrappedDek.Length];
+                using var gcm = new AesGcm(kek, GcmTagSize);
+                gcm.Decrypt(dekNonce, wrappedDek, dekTag, dek);
+                return dek;
+            }
+            catch (CryptographicException)
+            {
+                return null;
             }
         }
 
@@ -819,9 +933,18 @@ namespace SecureFileUpload.Services
         }
 
         /// <summary>
-        /// Write a validated file to permanent storage, optionally encrypting with AES-256-GCM.
-        /// Zeroes plaintext buffers after encryption to minimize exposure window in memory.
+        /// Write a validated file to permanent storage.
+        ///
+        /// Steps:
+        ///   1. Read the upload into memory.
+        ///   2. (Gap 1) For JPEG/PNG/WebP, re-encode through ImageSharp to strip any
+        ///      polyglot tail / appended payload. Falls back to original bytes on failure
+        ///      so a malformed-but-valid edge case never blocks an already-validated upload.
+        ///   3. Either write plaintext to disk, or encrypt with envelope encryption (v2).
+        ///
         /// Throws InvalidOperationException if encryption is enabled but no key is available.
+        /// All plaintext and DEK buffers are zeroed in finally blocks to minimize
+        /// the in-memory exposure window for sensitive patron content.
         /// </summary>
         private async Task WriteFileToDiskAsync(IFormFile file, string filePath, string newFileName, int fileIndex)
         {
@@ -833,53 +956,142 @@ namespace SecureFileUpload.Services
                 throw new InvalidOperationException("Encryption enabled but no key configured.");
             }
 
-            if (_encryptionEnabled && _encryptionKey != null)
+            var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+            byte[] plaintext = await GetSanitizedPlaintextAsync(file, extension);
+
+            try
             {
-                using var ms = new MemoryStream();
-                await file.CopyToAsync(ms);
-                ms.Position = 0;
-
-                // AES-256-GCM: authenticated encryption — any tampering
-                // (bit-flip, truncation, substitution) is detected at decrypt
-                // time via the 128-bit authentication tag.
-                //
-                // File layout: [8 marker][12 nonce][16 tag][ciphertext]
-                var nonce      = new byte[GcmNonceSize];
-                var tag        = new byte[GcmTagSize];
-                var plaintext  = ms.ToArray();
-                var ciphertext = new byte[plaintext.Length];
-                RandomNumberGenerator.Fill(nonce);
-
-                try
+                if (_encryptionEnabled && _encryptionKey != null)
                 {
-                    using (var gcm = new AesGcm(_encryptionKey, GcmTagSize))
-                        gcm.Encrypt(nonce, plaintext, ciphertext, tag);
-
-                    using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write);
-                    await fs.WriteAsync(GcmEncryptedFileMarker);
-                    await fs.WriteAsync(nonce);
-                    await fs.WriteAsync(tag);
-                    await fs.WriteAsync(ciphertext);
+                    await WriteEnvelopeEncryptedAsync(plaintext, filePath, _encryptionKey);
+                    _logger.LogInformation(
+                        "FILE_ENCRYPT_SUCCESS | Format: GCM-v2-Envelope | SavedAs: {NewName} | OriginalSize: {Orig:N0} | StoredSize: {Stored:N0} | Index: {Index}",
+                        newFileName, file.Length, plaintext.Length + GcmV2HeaderSize, fileIndex);
                 }
-                finally
+                else
                 {
-                    // Zero plaintext as soon as possible to minimize exposure in memory.
-                    // Not a guarantee (GC may have copies) but reduces the window.
-                    CryptographicOperations.ZeroMemory(plaintext);
+                    await File.WriteAllBytesAsync(filePath, plaintext);
+                    _logger.LogInformation(
+                        "FILE_SAVED | SavedAs: {NewName} | Size: {Size:N0} bytes | Index: {Index}",
+                        newFileName, plaintext.Length, fileIndex);
                 }
-
-                _logger.LogInformation(
-                    "FILE_ENCRYPT_SUCCESS | SavedAs: {NewName} | Size: {Size:N0} bytes | Index: {Index}",
-                    newFileName, file.Length, fileIndex);
             }
-            else
+            finally
             {
-                using var stream = new FileStream(filePath, FileMode.Create);
-                await file.CopyToAsync(stream);
+                // Zero plaintext as soon as possible to minimize exposure in memory.
+                // Not a guarantee (GC may have copies) but reduces the window.
+                CryptographicOperations.ZeroMemory(plaintext);
+            }
+        }
 
+        /// <summary>
+        /// Reads the upload to memory and, for image types when recompression is enabled,
+        /// decodes and re-encodes through ImageSharp. This Gap 1 mitigation eliminates
+        /// polyglot tails (data appended after the structural end of an image), since
+        /// ImageSharp emits only the bytes the encoder produces.
+        ///
+        /// PDF and other types are returned unmodified — recompression is image-only.
+        /// On any decode/encode failure, the original validated bytes are returned and
+        /// the failure is logged. The file already passed all eight validation layers,
+        /// so falling back is preferable to silently rejecting an already-clean upload.
+        /// </summary>
+        private async Task<byte[]> GetSanitizedPlaintextAsync(IFormFile file, string extension)
+        {
+            using var ms = new MemoryStream(checked((int)Math.Min(file.Length, int.MaxValue)));
+            await file.CopyToAsync(ms);
+            byte[] original = ms.ToArray();
+
+            bool isRecompressable =
+                extension == ".jpg" || extension == ".jpeg" ||
+                extension == ".png" || extension == ".webp";
+
+            if (!_recompressImages || !isRecompressable)
+                return original;
+
+            try
+            {
+                using var inMs = new MemoryStream(original, writable: false);
+                using var image = await Image.LoadAsync(inMs);
+                using var outMs = new MemoryStream();
+
+                switch (extension)
+                {
+                    case ".jpg":
+                    case ".jpeg":
+                        await image.SaveAsJpegAsync(outMs, new JpegEncoder { Quality = _jpegRecompressQuality });
+                        break;
+                    case ".png":
+                        // PNG is lossless — re-encode preserves visual content exactly.
+                        await image.SaveAsPngAsync(outMs, new PngEncoder());
+                        break;
+                    case ".webp":
+                        // Default WebP encoding; content already passed pixel-count limits in Layer 6.
+                        await image.SaveAsWebpAsync(outMs, new WebpEncoder());
+                        break;
+                }
+
+                byte[] sanitized = outMs.ToArray();
                 _logger.LogInformation(
-                    "FILE_SAVED | SavedAs: {NewName} | Size: {Size:N0} bytes | Index: {Index}",
-                    newFileName, file.Length, fileIndex);
+                    "IMAGE_RECOMPRESSED | Ext: {Ext} | OriginalBytes: {Orig:N0} | SanitizedBytes: {New:N0} | Delta: {Delta:N0}",
+                    extension, original.Length, sanitized.Length, sanitized.Length - original.Length);
+                return sanitized;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "IMAGE_RECOMPRESS_FAILED | Ext: {Ext} | Falling back to original validated bytes (file already passed all 8 layers).",
+                    extension);
+                return original;
+            }
+        }
+
+        /// <summary>
+        /// Writes a file using envelope encryption (format v2):
+        ///   1. Generate a fresh random 256-bit Data Encryption Key (DEK).
+        ///   2. Encrypt the file payload under the DEK with AES-256-GCM (file_nonce, file_tag).
+        ///   3. Wrap (encrypt) the DEK under the master KEK with AES-256-GCM (dek_nonce, dek_tag).
+        ///   4. Persist: marker || dek_nonce || dek_tag || wrapped_dek || file_nonce || file_tag || ciphertext
+        ///
+        /// Why envelope encryption (Gap 8): the master key (KEK) can be rotated by
+        /// re-wrapping each file's DEK under a new KEK — no need to decrypt and
+        /// re-encrypt the file payloads themselves. The DEK is also unique per file,
+        /// so a single nonce reuse would not affect any other file.
+        /// </summary>
+        private async Task WriteEnvelopeEncryptedAsync(byte[] plaintext, string filePath, byte[] masterKek)
+        {
+            byte[] dek          = new byte[DekSize];
+            byte[] wrappedDek   = new byte[DekSize];
+            byte[] dekNonce     = new byte[GcmNonceSize];
+            byte[] dekTag       = new byte[GcmTagSize];
+            byte[] fileNonce    = new byte[GcmNonceSize];
+            byte[] fileTag      = new byte[GcmTagSize];
+            byte[] ciphertext   = new byte[plaintext.Length];
+
+            try
+            {
+                RandomNumberGenerator.Fill(dek);
+                RandomNumberGenerator.Fill(dekNonce);
+                RandomNumberGenerator.Fill(fileNonce);
+
+                using (var fileGcm = new AesGcm(dek, GcmTagSize))
+                    fileGcm.Encrypt(fileNonce, plaintext, ciphertext, fileTag);
+
+                using (var kekGcm = new AesGcm(masterKek, GcmTagSize))
+                    kekGcm.Encrypt(dekNonce, dek, wrappedDek, dekTag);
+
+                using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write);
+                await fs.WriteAsync(GcmEncryptedFileMarkerV2);
+                await fs.WriteAsync(dekNonce);
+                await fs.WriteAsync(dekTag);
+                await fs.WriteAsync(wrappedDek);
+                await fs.WriteAsync(fileNonce);
+                await fs.WriteAsync(fileTag);
+                await fs.WriteAsync(ciphertext);
+            }
+            finally
+            {
+                // Zero the raw DEK immediately — the wrapped form on disk is what survives.
+                CryptographicOperations.ZeroMemory(dek);
             }
         }
 

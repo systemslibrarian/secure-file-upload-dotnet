@@ -6,6 +6,7 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -28,6 +29,26 @@ namespace SecureFileUpload.Services
         /// If true, form-like PDFs (/AcroForm) are rejected even without active JavaScript.
         /// </summary>
         public bool RejectInteractivePdfs { get; set; } = false;
+
+        /// <summary>
+        /// Gap 2 mitigation: when true, locate raw `stream … endstream` blocks in the PDF,
+        /// attempt FlateDecode (zlib/deflate) decompression, and re-run the dangerous
+        /// pattern scan against the decompressed bytes. Compressed PDF streams are
+        /// otherwise opaque to the byte-level pattern scanner.
+        /// </summary>
+        public bool InspectCompressedPdfStreams { get; set; } = true;
+
+        /// <summary>
+        /// Maximum number of compressed PDF streams to inspect per file. Caps the cost
+        /// of decompressing a maliciously crafted PDF with thousands of tiny streams.
+        /// </summary>
+        public int MaxCompressedStreamsToInspect { get; set; } = 64;
+
+        /// <summary>
+        /// Maximum total decompressed bytes inspected per file (across all streams).
+        /// Prevents zip-bomb style decompression amplification attacks.
+        /// </summary>
+        public int MaxDecompressedStreamBytes { get; set; } = 16 * 1024 * 1024;
 
         /// <summary>
         /// Maximum filename length recorded in security logs.
@@ -547,6 +568,15 @@ namespace SecureFileUpload.Services
             if (ContainsNullByteSequence(bytes, 10))
                 _logger.LogDebug("PDF_NULL_BYTES_DETECTED | FileName: {FileName} | Non-blocking", fileName);
 
+            // Gap 2 mitigation: inspect FlateDecode-compressed streams.
+            // Without this, /JavaScript or /Launch hidden inside compressed streams
+            // would be invisible to the byte-level pattern scanner above.
+            if (_options.InspectCompressedPdfStreams)
+            {
+                if (ScanCompressedPdfStreams(bytes, fileName) is { } streamThreat)
+                    return streamThreat;
+            }
+
             // PDF already has `content` from the Latin1 decode above — pass it
             // directly to avoid a redundant decode inside RunCommonThreatScans.
             if (RunCommonThreatScans(bytes, content, fileName, "PDF") is { } threatResult)
@@ -554,6 +584,147 @@ namespace SecureFileUpload.Services
 
             _logger.LogDebug("PDF deep validation PASSED for {FileName}", fileName);
             return ContentValidationResult.Allow("PDF-DeepScan");
+        }
+
+        // ── Gap 2: FlateDecode-compressed PDF stream scanner ──────────────────────
+        //
+        // PDF object streams are commonly Flate (zlib) compressed. Threat tokens
+        // such as /JavaScript, /JS, /Launch, /OpenAction can be hidden inside
+        // these compressed blobs and are invisible to a plain byte/text scan.
+        //
+        // This helper walks the raw bytes for `stream` … `endstream` pairs (the
+        // PDF spec literal markers) and tries to inflate each block. If inflation
+        // succeeds, the decompressed bytes are re-scanned for the same dangerous
+        // patterns the outer Layer 6 scan looks for.
+        //
+        // Hard caps (configurable):
+        //   • MaxCompressedStreamsToInspect — bounds CPU per file
+        //   • MaxDecompressedStreamBytes    — bounds memory (zip-bomb defence)
+        //
+        // Failure mode is fail-open per stream (malformed inflate → skip), but
+        // fail-closed for the file overall if any decompressed pattern matches.
+        private ContentValidationResult? ScanCompressedPdfStreams(byte[] bytes, string fileName)
+        {
+            ReadOnlySpan<byte> streamMarker = "stream"u8;
+            ReadOnlySpan<byte> endMarker = "endstream"u8;
+
+            int totalDecompressed = 0;
+            int streamsInspected = 0;
+            int searchFrom = 0;
+
+            while (searchFrom < bytes.Length &&
+                   streamsInspected < _options.MaxCompressedStreamsToInspect &&
+                   totalDecompressed < _options.MaxDecompressedStreamBytes)
+            {
+                int sIdx = IndexOf(bytes, streamMarker, searchFrom);
+                if (sIdx < 0) break;
+
+                // Move past `stream` keyword and the required EOL (LF or CRLF).
+                int dataStart = sIdx + streamMarker.Length;
+                if (dataStart >= bytes.Length) break;
+                if (bytes[dataStart] == (byte)'\r') dataStart++;
+                if (dataStart < bytes.Length && bytes[dataStart] == (byte)'\n') dataStart++;
+
+                int eIdx = IndexOf(bytes, endMarker, dataStart);
+                if (eIdx < 0) break;
+
+                int dataEnd = eIdx;
+                // Trim trailing EOL before `endstream` per PDF spec.
+                if (dataEnd > dataStart && bytes[dataEnd - 1] == (byte)'\n') dataEnd--;
+                if (dataEnd > dataStart && bytes[dataEnd - 1] == (byte)'\r') dataEnd--;
+
+                int rawLen = dataEnd - dataStart;
+                searchFrom = eIdx + endMarker.Length;
+
+                if (rawLen <= 2) continue;
+                streamsInspected++;
+
+                // Try to inflate. PDF FlateDecode is zlib-wrapped (RFC 1950), so
+                // skip the 2-byte zlib header before feeding to DeflateStream
+                // (which speaks raw RFC 1951 deflate).
+                byte b0 = bytes[dataStart];
+                byte b1 = bytes[dataStart + 1];
+                bool looksLikeZlib = (b0 & 0x0F) == 0x08 && (((b0 << 8) | b1) % 31 == 0);
+                int deflateOffset = looksLikeZlib ? 2 : 0;
+                int deflateLen = rawLen - deflateOffset;
+                if (deflateLen <= 0) continue;
+
+                int budget = _options.MaxDecompressedStreamBytes - totalDecompressed;
+                if (budget <= 0) break;
+
+                byte[]? inflated;
+                try
+                {
+                    using var src = new MemoryStream(bytes, dataStart + deflateOffset, deflateLen, writable: false);
+                    using var inflater = new DeflateStream(src, CompressionMode.Decompress, leaveOpen: false);
+                    using var dst = new MemoryStream();
+                    var buf = new byte[8192];
+                    int read;
+                    int written = 0;
+                    while ((read = inflater.Read(buf, 0, buf.Length)) > 0)
+                    {
+                        written += read;
+                        if (written > budget)
+                        {
+                            // Stop this stream — over the per-file budget. Skip
+                            // rather than reject (could be legitimate large image).
+                            dst.Write(buf, 0, read - (written - budget));
+                            break;
+                        }
+                        dst.Write(buf, 0, read);
+                    }
+                    inflated = dst.ToArray();
+                }
+                catch
+                {
+                    // Malformed / non-Flate / encrypted stream — silently skip.
+                    continue;
+                }
+
+                if (inflated.Length == 0) continue;
+                totalDecompressed += inflated.Length;
+
+                string decoded = Encoding.Latin1.GetString(inflated);
+
+                foreach (string pattern in DangerousPdfPatterns)
+                {
+                    if (decoded.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                    // Mirror outer-scan policy nuance: /AcroForm only fails when
+                    // interactive PDFs are explicitly rejected.
+                    if (pattern.Equals("/AcroForm", StringComparison.OrdinalIgnoreCase) &&
+                        !_options.RejectInteractivePdfs)
+                        continue;
+
+                    return RejectMalicious(
+                        fileName, "PDF",
+                        $"Dangerous pattern '{pattern}' found inside FlateDecode-compressed stream.",
+                        "PDF-CompressedStreamThreat");
+                }
+
+                foreach (string jsToken in JsTriggerPatterns)
+                {
+                    if (decoded.IndexOf(jsToken, StringComparison.OrdinalIgnoreCase) >= 0)
+                        return RejectMalicious(
+                            fileName, "PDF",
+                            $"JavaScript trigger '{jsToken}' found inside FlateDecode-compressed stream.",
+                            "PDF-CompressedStreamThreat");
+                }
+            }
+
+            if (streamsInspected > 0)
+                _logger.LogDebug(
+                    "PDF_COMPRESSED_STREAMS_SCANNED | FileName: {FileName} | Streams: {Count} | DecompressedBytes: {Bytes}",
+                    fileName, streamsInspected, totalDecompressed);
+
+            return null;
+        }
+
+        private static int IndexOf(byte[] haystack, ReadOnlySpan<byte> needle, int start)
+        {
+            if (start < 0) start = 0;
+            if (start >= haystack.Length || needle.Length == 0) return -1;
+            return haystack.AsSpan(start).IndexOf(needle) is var rel && rel < 0 ? -1 : rel + start;
         }
 
         // ── Images ────────────────────────────────────────────────────────────────
