@@ -18,7 +18,7 @@ namespace SecureFileUpload.Services
     /// Talks directly to a clamd daemon over TCP using the documented INSTREAM
     /// command, so no temp file is written and the patron's plaintext bytes
     /// never touch disk. clamd replies with either "stream: OK" or
-    /// "stream: <SignatureName> FOUND".
+    /// "stream: &lt;SignatureName&gt; FOUND".
     ///
     /// Cross-platform alternative to <see cref="WindowsDefenderScanService"/>:
     ///   • Linux / macOS / containers

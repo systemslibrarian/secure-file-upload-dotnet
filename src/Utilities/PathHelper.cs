@@ -16,7 +16,7 @@ namespace SecureFileUpload.Utilities
         /// Returns <see langword="true"/> if <paramref name="candidatePath"/> is
         /// strictly inside <paramref name="basePath"/>, or is exactly equal to it.
         ///
-        /// Both paths are canonicalized with <see cref="Path.GetFullPath"/> before
+        /// Both paths are canonicalized with <see cref="Path.GetFullPath(string)"/> before
         /// comparison. The check appends a directory separator to the base before
         /// testing the prefix so that a sibling folder whose name begins with the
         /// same characters cannot match. For example:
