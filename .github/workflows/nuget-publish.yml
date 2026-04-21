@@ -108,10 +108,21 @@ jobs:
           path: nupkgs
         continue-on-error: true   # symbol upload is non-fatal
 
+      - name: Validate NuGet API key is configured
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "::error::Missing NUGET_API_KEY secret. Add it in Settings > Secrets and variables > Actions (repo secret) or Environment secrets for 'nuget-publish'."
+            exit 1
+          fi
+
       - name: Push to NuGet.org
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: >
           dotnet nuget push nupkgs/*.nupkg
-          --api-key ${{ secrets.NUGET_API_KEY }}
+          --api-key "$NUGET_API_KEY"
           --source https://api.nuget.org/v3/index.json
           --skip-duplicate
         # NUGET_API_KEY must be set in the repository's
