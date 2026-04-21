@@ -98,7 +98,9 @@ Every uploaded file passes through all layers in order. **Failure at any layer r
 | `src/FileContentValidator.cs` | Layer 6 deep content validation. Format-specific structural walking for JPEG, PNG, WebP, PDF. Pattern-based threat detection. **FlateDecode-compressed PDF stream inspection** (Gap 2 mitigation). Fail-closed on unknown types. |
 | `src/WindowsDefenderScanService.cs` | Layer 7 virus scanning via Windows Defender `MpCmdRun.exe`. Includes temp-file secure delete (zero-before-delete). Use on Windows. |
 | `src/ClamAvScanService.cs` | Layer 7 virus scanning via `clamd` over TCP using the `zINSTREAM` protocol. No temp file written — patron bytes never touch disk. Use on Linux / containers / macOS. |
+| `src/SecureFileDownloadController.cs` | Reference staff-side download handler. Forces `Content-Disposition: attachment`, locks down response headers (CSP `sandbox`, `nosniff`, `X-Frame-Options: DENY`, COOP/COEP/CORP, no-store), and re-checks path traversal at read time. |
 | `src/ReplacementCardInputModel.cs` | Example model showing how file uploads are bound via `List<IFormFile>` in a multipart form alongside validated patron fields. |
+| `tests/Fuzz/` | SharpFuzz + AFL++ harness for `FileContentValidator.ValidateAsync`. Catches unhandled exceptions, hangs, and runaway allocation in attacker-crafted inputs. See `tests/Fuzz/README.md`. |
 
 ---
 
@@ -145,6 +147,16 @@ Every attacker-controlled filename is run through `SanitizeForLog` before being 
 - **`ClamAvScanService`** — talks to `clamd` directly over TCP using the documented `zINSTREAM` protocol. No temp file is written. Cross-platform (Linux, macOS, containers).
 
 Both are fail-closed: any scanner exception or error response causes the upload to be marked NotScanned (file already passed Layers 1–6, never silently "clean").
+
+### Hardened Download Surface (`SecureFileDownloadController`)
+Serving decrypted patron documents safely is a separate problem from accepting them safely. The reference download controller:
+
+- Re-checks path traversal at read time (defence in depth on top of upload-time check).
+- Forces every response to `Content-Type: application/octet-stream` + `Content-Disposition: attachment` so the browser **cannot render the file inline** — PDFs never invoke Adobe Reader, images never get MIME-sniffed as HTML.
+- Sends a strict header set: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy: default-src 'none'; … sandbox`, `Cache-Control: no-store, private`, `Cross-Origin-{Resource,Opener,Embedder}-Policy`, `Referrer-Policy: no-referrer`, restrictive `Permissions-Policy`.
+- Encodes the filename via `ContentDispositionHeaderValue.SetHttpFileName` (RFC 6266 UTF-8) to defeat header injection.
+
+Wire it under an authenticated, MFA-gated staff route. Do **not** expose it anonymously.
 
 ### Secure Temp File Deletion (WindowsDefenderScanService)
 The virus scanner writes files to a temp directory for scanning. After scanning, the temp file is overwritten with zeros before deletion. This reduces (though does not guarantee) recovery of sensitive content from freed disk sectors.

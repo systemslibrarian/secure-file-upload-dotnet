@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SecureFileUpload.Fuzz</RootNamespace>
+    <AssemblyName>FuzzHarness</AssemblyName>
+
+    <!-- Fuzzing wants release-mode code with no JIT optimisations that drop
+         coverage edges. SharpFuzz instruments the published assembly. -->
+    <Optimize>true</Optimize>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <TieredCompilation>false</TieredCompilation>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SharpFuzz" Version="2.1.1" />
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
+  </ItemGroup>
+
+  <!--
+    Adjust this to point at the project that contains FileContentValidator.
+    The deep validator is currently distributed as loose source files in /src,
+    so consumers will typically have it inside their own ASP.NET Core project.
+    Replace the <Compile Include> lines below with a <ProjectReference> if you
+    move the validator into a class library.
+  -->
+  <ItemGroup>
+    <Compile Include="..\..\src\FileContentValidator.cs" Link="FileContentValidator.cs" />
+  </ItemGroup>
+
+</Project>
