@@ -1,11 +1,11 @@
 # SecureFileUpload.Core
 
-**Defense-in-depth file upload pipeline for ASP.NET Core 10+ — AES-256-GCM envelope encryption, Argon2id key derivation, deep content validation, and pluggable virus scanning.**
+**Defense-in-depth file upload pipeline for ASP.NET Core 8 / 9 / 10 — AES-256-GCM envelope encryption, Argon2id key derivation, deep content validation, and pluggable virus scanning.**
 
 [![NuGet](https://img.shields.io/nuget/v/SecureFileUpload.Core.svg?style=flat-square)](https://www.nuget.org/packages/SecureFileUpload.Core)
 [![NuGet downloads](https://img.shields.io/nuget/dt/SecureFileUpload.Core.svg?style=flat-square)](https://www.nuget.org/packages/SecureFileUpload.Core)
 [![Build](https://github.com/systemslibrarian/secure-file-upload-dotnet/actions/workflows/nuget-publish.yml/badge.svg)](https://github.com/systemslibrarian/secure-file-upload-dotnet/actions/workflows/nuget-publish.yml)
-[![Target: net10.0](https://img.shields.io/badge/target-net10.0-512BD4.svg?style=flat-square)](https://dotnet.microsoft.com/)
+[![Targets: net8.0 / net9.0 / net10.0](https://img.shields.io/badge/targets-net8.0%20%7C%20net9.0%20%7C%20net10.0-512BD4.svg?style=flat-square)](https://dotnet.microsoft.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 
 `SecureFileUpload.Core` is a battle-tested file-upload pipeline lifted from a production ASP.NET Core document-intake workflow, de-branded, hardened, and shipped as a single NuGet package. Every layer is implemented in code you can read; every limitation is named in [`KNOWN-GAPS.md`](KNOWN-GAPS.md); every security claim traces to a specific line in `src/` per the audit in [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md).
@@ -15,6 +15,14 @@
 
 ---
 
+## What's New in 3.0.2
+
+`3.0.2` restores **multi-targeting** for `net8.0`, `net9.0`, and `net10.0`. Dropping to `net10.0`-only in `3.0.0` was a strategic mistake — it forced consumers on currently-supported LTS / STS runtimes to either pin to the `2.x` line or upgrade their host before they could take any of the `3.x` hardening. This release re-publishes the same source as a multi-targeted package.
+
+- **TargetFrameworks: `net8.0;net9.0;net10.0`.** Same source, same crypto posture, same on-disk envelope formats. The entire pipeline already compiled against the .NET 8 BCL; no conditional compilation was needed.
+- **No behavioral or breaking changes from `3.0.1`.** Argon2id KEK derivation, AES-256-GCM v2 envelope, legacy PBKDF2 fallback, opaque download tokens, hardened download controller, and Data Protection deployment guidance are unchanged.
+- **AssemblyVersion stays at `3.0.0.0`** so this is a drop-in upgrade with no binding-redirect change required.
+
 ## What's New in 3.0.0
 
 `3.0.0` is the hardened download-surface release. **The 8-layer upload pipeline and on-disk crypto formats are unchanged from `2.0.0`.** This release is about the staff-download contract, release validation, and operator-facing correctness.
@@ -23,12 +31,11 @@
 - **Release validation is now an actual gate.** The solution tests and the runtime smoke harness both run in CI before pack/publish, so the NuGet package is validated against the same path documented in this repo.
 - **Scanner outage logs now match runtime behavior.** ClamAV and Windows Defender unavailability are logged as `NotScanned` fail-open conditions instead of incorrectly implying fail-closed rejection.
 
-`2.0.0` was the first stable release of the modernized line. If you're upgrading from `1.0.0`, the major crypto/runtime changes from that release still apply: the TFM moved from `net8.0` to `net10.0`, and the KEK derivation default changed to Argon2id.
+`2.0.0` was the first stable release of the modernized line. The Argon2id KEK and PBKDF2 fallback story from that release still applies:
 
 - **Argon2id for KEK derivation.** The master Key Encryption Key is now derived via Argon2id (RFC 9106, OWASP 2024+ recommendation) with memory-hard defaults — `m=64 MiB, t=3, p=4`. Memory-hardness raises the cost-per-guess on GPUs and ASICs by orders of magnitude over the prior PBKDF2-SHA256 derivation.
 - **Backward-compatible online upgrade.** Files wrapped under prior PBKDF2 KEKs (600 000 and 210 000 iterations) still decrypt via `FileUpload:KeyDerivation:LegacyKekFallback=true` (default). No file on disk is bricked by the upgrade. New writes always use the Argon2id-derived KEK.
 - **Configurable KDF.** Argon2id is the default; `KeyDerivation:Algorithm = "Pbkdf2"` is available for FIPS-restricted environments. All Argon2id parameters and the PBKDF2 iteration count are tunable from `appsettings.json`.
-- **.NET 10.** Target framework consolidated on `net10.0` only. Pin `1.0.x-preview.0` if you need a `net8.0`-only build.
 - **Packaging.** Deterministic build, Source Link, `.snupkg` symbols, and `README.md` / `LICENSE` / `SECURITY-ANALYSIS.md` / `KNOWN-GAPS.md` bundled inside the package itself.
 
 The crypto posture, parameters, and honest residual risks are documented in [Implementation & Crypto Posture](#implementation--crypto-posture) below and in [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md).
@@ -117,9 +124,17 @@ Every uploaded file passes through eight serial layers. **Failure at any content
 dotnet add package SecureFileUpload.Core
 ```
 
-Requires **.NET 10+** with ASP.NET Core. The package references `Microsoft.AspNetCore.App` as a framework reference, so nothing extra ships inside it — your runtime's existing ASP.NET Core does the heavy lifting.
+Multi-targets **`net8.0`**, **`net9.0`**, and **`net10.0`** — same source, same crypto posture, on every currently-supported .NET runtime. The package references `Microsoft.AspNetCore.App` as a framework reference, so nothing extra ships inside it; your runtime's existing ASP.NET Core does the heavy lifting.
 
-If you need a `net8.0` build, pin to `1.0.0` (the prior stable line) — Argon2id and `net10.0` arrived in the `1.0.0-preview.2` candidates and are the default in `2.0.0`.
+Pick the TFM that matches your host:
+
+| Host runtime              | NuGet picks         | Notes |
+|---------------------------|---------------------|-------|
+| .NET 8 (LTS, in support)  | `net8.0` build      | Same `FileUploadService` / `FileContentValidator` source. |
+| .NET 9 (STS, in support)  | `net9.0` build      | Same source. |
+| .NET 10 (LTS, current)    | `net10.0` build     | Same source. |
+
+> If you're upgrading from `3.0.0` / `3.0.1`, this is a drop-in change — `AssemblyVersion` is unchanged at `3.0.0.0` and the on-disk envelope formats (`ENCGCM\0\x01` / `ENCGCM\0\x02`) are byte-for-byte compatible. No re-wrap, no migration.
 
 ---
 

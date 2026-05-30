@@ -26,10 +26,13 @@ jobs:
         with:
           fetch-depth: 0   # full history required for Source Link
 
-      - name: Set up .NET 10
+      - name: Set up .NET SDKs (8 / 9 / 10)
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
 
       - name: Determine package version
         id: package-version
@@ -58,8 +61,14 @@ jobs:
       - name: Run solution tests
         run: dotnet test secure-file-upload-dotnet.sln --configuration Release --no-build
 
-      - name: Run smoke harness
-        run: dotnet run --project tests/SmokeTest/SmokeTest.csproj --configuration Release --no-build
+      - name: Run smoke harness (net8.0)
+        run: dotnet run --project tests/SmokeTest/SmokeTest.csproj --configuration Release --no-build --framework net8.0
+
+      - name: Run smoke harness (net9.0)
+        run: dotnet run --project tests/SmokeTest/SmokeTest.csproj --configuration Release --no-build --framework net9.0
+
+      - name: Run smoke harness (net10.0)
+        run: dotnet run --project tests/SmokeTest/SmokeTest.csproj --configuration Release --no-build --framework net10.0
 
       - name: Pack
         run: >
@@ -101,6 +110,9 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      # FuzzHarness intentionally stays single-target (net10.0). The class
+      # library it project-references is multi-target; .NET 10 SDK picks
+      # the matching net10.0 build automatically.
       - name: Restore
         run: dotnet restore tests/Fuzz/FuzzHarness.csproj
 

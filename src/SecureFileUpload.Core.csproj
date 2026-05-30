@@ -1,14 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- ── Target framework ────────────────────────────────────────────── -->
+    <!-- ── Target frameworks ───────────────────────────────────────────── -->
     <!--
-      v1.0.0 targets net10.0 only. Earlier .NET targets were dropped to
-      consolidate on a single LTS-class runtime, take advantage of newer
-      crypto APIs, and simplify the dependency surface. If you need
-      net8.0 support, pin to a 1.0.x-preview.0 build of this package.
+      3.0.2 restores multi-targeting (net8.0; net9.0; net10.0) so the package
+      is usable on every currently-supported .NET LTS / STS line without
+      forcing consumers to chase the latest runtime. The 8-layer pipeline,
+      Argon2id KEK derivation, AES-256-GCM envelope format, and download-token
+      surface compile against the .NET 8+ BCL — no net10-only APIs are used.
+      All three target frameworks load the same source.
     -->
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
@@ -17,17 +19,17 @@
 
     <!-- ── NuGet package metadata ─────────────────────────────────────── -->
     <PackageId>SecureFileUpload.Core</PackageId>
-    <Version>3.0.1</Version>
+    <Version>3.0.2</Version>
     <AssemblyVersion>3.0.0.0</AssemblyVersion>
-    <FileVersion>3.0.1.0</FileVersion>
-    <InformationalVersion>3.0.1</InformationalVersion>
+    <FileVersion>3.0.2.0</FileVersion>
+    <InformationalVersion>3.0.2</InformationalVersion>
     <Authors>Paul Clark (systemslibrarian)</Authors>
     <Company>systemslibrarian</Company>
     <Product>SecureFileUpload.Core</Product>
     <Copyright>Copyright (c) 2026 Paul Clark</Copyright>
-    <Title>SecureFileUpload.Core — defense-in-depth file upload for ASP.NET Core 10+</Title>
-    <Description>Defense-in-depth file upload pipeline for ASP.NET Core 10+. An 8-layer validation and encrypted-storage pipeline lifted from a production document-intake workflow: size + batch limits, extension allowlist, MIME / extension cross-check, magic-byte signatures, filename inspection, deep structural content validation (JPEG / PNG / WebP walkers + PDF pattern scan with FlateDecode-compressed stream inspection), pluggable virus scanning (Windows Defender or ClamAV), and AES-256-GCM envelope encryption with a per-file random DEK wrapped under an Argon2id-derived master KEK (RFC 9106 / OWASP 2024+). Includes a hardened reference download controller, image recompression to strip polyglot tails, secret-misconfiguration startup guards, and a SharpFuzz / AFL++ harness for the deep content validator. Honest limitations documented in KNOWN-GAPS.md; every security claim traces to source in SECURITY-ANALYSIS.md.</Description>
-    <PackageTags>aspnetcore;security;file-upload;upload;antivirus;clamav;windows-defender;malware;encryption;aes-gcm;aes256;argon2id;kdf;rfc9106;validation;defense-in-depth;polyglot;pdf;owasp;net10</PackageTags>
+    <Title>SecureFileUpload.Core — defense-in-depth file upload for ASP.NET Core 8 / 9 / 10</Title>
+    <Description>Defense-in-depth file upload pipeline for ASP.NET Core 8, 9, and 10. An 8-layer validation and encrypted-storage pipeline lifted from a production document-intake workflow: size + batch limits, extension allowlist, MIME / extension cross-check, magic-byte signatures, filename inspection, deep structural content validation (JPEG / PNG / WebP walkers + PDF pattern scan with FlateDecode-compressed stream inspection), pluggable virus scanning (Windows Defender or ClamAV), and AES-256-GCM envelope encryption with a per-file random DEK wrapped under an Argon2id-derived master KEK (RFC 9106 / OWASP 2024+). Includes a hardened reference download controller, image recompression to strip polyglot tails, secret-misconfiguration startup guards, and a SharpFuzz / AFL++ harness for the deep content validator. Multi-targets net8.0 / net9.0 / net10.0 — same source, same crypto posture, on every currently-supported .NET runtime. Honest limitations documented in KNOWN-GAPS.md; every security claim traces to source in SECURITY-ANALYSIS.md.</Description>
+    <PackageTags>aspnetcore;security;file-upload;upload;antivirus;clamav;windows-defender;malware;encryption;aes-gcm;aes256;argon2id;kdf;rfc9106;validation;defense-in-depth;polyglot;pdf;owasp;net8;net9;net10</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageIcon></PackageIcon>
@@ -36,6 +38,25 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryBranch>main</RepositoryBranch>
     <PackageReleaseNotes>
+v3.0.2 — multi-targeting restored (net8.0; net9.0; net10.0).
+
+No behavioral, on-disk-format, or crypto-posture changes from 3.0.1. The
+3.0.0 / 3.0.1 packages narrowed the target framework to net10.0 only,
+which forced consumers on currently-supported .NET 8 LTS or .NET 9 STS
+runtimes to either pin to the 2.x line or upgrade their host. This
+release re-publishes the same source as a multi-targeted package so any
+supported .NET runtime can take 3.x.
+
+  • TargetFrameworks: net8.0;net9.0;net10.0.
+  • No conditional compilation needed — the entire pipeline already
+    compiled against the .NET 8 BCL (AesGcm two-arg constructor,
+    Rfc2898DeriveBytes.Pbkdf2 static, Encoding.Latin1, UTF-8 string
+    literals, Konscious Argon2id).
+  • AssemblyVersion stays at 3.0.0.0 so this is a drop-in upgrade with
+    no binding-redirect change required.
+  • README, install instructions, and badges updated to reflect the
+    restored multi-target support.
+
 v3.0.1 — documentation and code-hygiene patch.
 
 No behavioral or breaking changes. Safe in-place upgrade from 3.0.0.
@@ -103,7 +124,8 @@ decryption compatibility are unchanged from 2.0.0.
   <!--
     Microsoft.AspNetCore.App ships as a shared framework on the target machine —
     referencing it here means it will NOT be bundled inside the package.
-    Consumers must target net10.0 or later with ASP.NET Core present.
+    Resolves to the matching ASP.NET Core 8.0 / 9.0 / 10.0 shared framework for
+    each TFM. Consumers need ASP.NET Core present at one of those versions.
   -->
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
