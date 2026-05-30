@@ -70,7 +70,7 @@ namespace SecureFileUpload.Services
             {
                 _logger.LogWarning(
                     "Windows Defender scanner NOT available at {Path} at startup. " +
-                    "Scans will be rejected until Defender is available. " +
+                    "Validated files will be accepted as NotScanned until Defender is available. " +
                     "Install Windows Defender or configure ClamAV instead.",
                     _mpCmdRunPath);
             }

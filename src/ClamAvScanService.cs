@@ -183,7 +183,7 @@ namespace SecureFileUpload.Services
             {
                 sw.Stop();
                 _logger.LogError(ex,
-                    "SECURITY_EVENT | CLAMAV_UNAVAILABLE | clamd unreachable at {Host}:{Port} — file {FileName} REJECTED (fail-closed)",
+                    "SECURITY_EVENT | CLAMAV_UNAVAILABLE | clamd unreachable at {Host}:{Port} — file {FileName} will be accepted as NotScanned by the pipeline",
                     _host, _port, fileName);
                 return Failed(sw, $"ClamAV daemon unreachable: {ex.Message}");
             }

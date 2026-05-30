@@ -1,4 +1,4 @@
-// Runtime smoke test for SecureFileUpload.Core 1.0.0-preview.2.
+// Runtime smoke test for SecureFileUpload.Core 2.0.0.
 //
 // Validates:
 //   1. Argon2id KEK derivation produces a 32-byte key in a reasonable time.
@@ -12,7 +12,7 @@
 //      to decrypt (proving the fallback gate actually gates).
 //
 // This is not a unit-test suite — it's a self-contained executable that
-// exits non-zero if any assertion fails. Run before publishing.
+// exits non-zero if any assertion fails. It is run in CI before publish.
 
 using Konscious.Security.Cryptography;
 using Microsoft.AspNetCore.Hosting;

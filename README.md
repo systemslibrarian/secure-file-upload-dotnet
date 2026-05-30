@@ -15,9 +15,15 @@
 
 ---
 
-## What's New in 2.0.0
+## What's New in 3.0.0
 
-`2.0.0` is the first stable release of the modernized line. **The 8-layer pipeline is unchanged from the 1.0.x preview series.** The crypto floor and the runtime target both moved up. If you're on `1.0.0`, treat this as a breaking upgrade — the TFM dropped from `net8.0` to `net10.0` and the KEK derivation defaults changed.
+`3.0.0` is the hardened download-surface release. **The 8-layer upload pipeline and on-disk crypto formats are unchanged from `2.0.0`.** This release is about the staff-download contract, release validation, and operator-facing correctness.
+
+- **Opaque download tokens replace path-based download links.** The reference controller now accepts `fileToken`, issued by `IFileAccessTokenService`, instead of a storage-relative path. If you linked staff downloads with `relativePath`, update that integration before upgrading.
+- **Release validation is now an actual gate.** The solution tests and the runtime smoke harness both run in CI before pack/publish, so the NuGet package is validated against the same path documented in this repo.
+- **Scanner outage logs now match runtime behavior.** ClamAV and Windows Defender unavailability are logged as `NotScanned` fail-open conditions instead of incorrectly implying fail-closed rejection.
+
+`2.0.0` was the first stable release of the modernized line. If you're upgrading from `1.0.0`, the major crypto/runtime changes from that release still apply: the TFM moved from `net8.0` to `net10.0`, and the KEK derivation default changed to Argon2id.
 
 - **Argon2id for KEK derivation.** The master Key Encryption Key is now derived via Argon2id (RFC 9106, OWASP 2024+ recommendation) with memory-hard defaults — `m=64 MiB, t=3, p=4`. Memory-hardness raises the cost-per-guess on GPUs and ASICs by orders of magnitude over the prior PBKDF2-SHA256 derivation.
 - **Backward-compatible online upgrade.** Files wrapped under prior PBKDF2 KEKs (600 000 and 210 000 iterations) still decrypt via `FileUpload:KeyDerivation:LegacyKekFallback=true` (default). No file on disk is bricked by the upgrade. New writes always use the Argon2id-derived KEK.
@@ -134,7 +140,7 @@ builder.Services.Configure<FormOptions>(options =>
 });
 ```
 
-`AddSecureFileUpload()` registers `FileContentValidator`, the platform-appropriate `IVirusScanService` (Windows Defender on Windows, ClamAV elsewhere), and `IFileUploadService` in one call. The scanner backend is picked at startup; switching it is one DI line, not a code change.
+`AddSecureFileUpload()` registers `FileContentValidator`, the platform-appropriate `IVirusScanService` (Windows Defender on Windows, ClamAV elsewhere), `IFileUploadService`, and `IFileAccessTokenService` in one call. The scanner backend is picked at startup; download tokens are issued through ASP.NET Core Data Protection with a short lifetime by default.
 
 ### 2. Receive an upload
 
@@ -165,12 +171,57 @@ public async Task<IActionResult> Submit(MyInputModel model)
 ### 3. Serve a file safely
 
 ```csharp
-// Wire the reference controller behind an authenticated, MFA-gated route.
-// SecureFileDownloadController forces Content-Disposition: attachment,
-// a strict CSP, X-Frame-Options: DENY, COOP/COEP/CORP, and re-checks
-// path traversal at read time — the file never renders inline.
-services.AddControllers().AddApplicationPart(typeof(SecureFileDownloadController).Assembly);
+using SecureFileUpload.Services;
+
+builder.Services
+  .AddAuthentication("Cookies")
+  .AddCookie("Cookies");
+
+builder.Services.AddAuthorization(options =>
+{
+  options.AddPolicy("StaffFiles", policy =>
+  {
+    policy.RequireAuthenticatedUser();
+    policy.RequireRole("Staff");
+    // Add your own MFA / claim requirements here.
+  });
+});
+
+// SecureFileDownloadController is [Authorize] by default. Apply your stricter
+// staff-only policy at the endpoint layer so the sample policy is actually used.
+builder.Services.AddControllers().AddApplicationPart(typeof(SecureFileDownloadController).Assembly);
+
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers().RequireAuthorization("StaffFiles");
 ```
+
+### 4. Issue an opaque download token
+
+```csharp
+public sealed class StaffFilesController : Controller
+{
+    private readonly IFileAccessTokenService _fileAccessTokenService;
+
+    public StaffFilesController(IFileAccessTokenService fileAccessTokenService)
+    {
+        _fileAccessTokenService = fileAccessTokenService;
+    }
+
+    public IActionResult DownloadFirst(FileUploadResult result)
+    {
+        string token = _fileAccessTokenService.CreateToken(result.UploadedFilePaths[0]);
+      string url = $"/staff/files/download?fileToken={Uri.EscapeDataString(token)}";
+        return Redirect(url);
+    }
+}
+```
+
+The token is opaque, signed, and short-lived by default. Staff-facing URLs never
+need to expose a storage-relative path.
+  If your application has both public and staff-only controllers, scope the
+  `RequireAuthorization("StaffFiles")` call to the staff route set instead of every
+  controller endpoint in the app.
 
 A complete `appsettings.json` reference is in [Configuration](#configuration) below.
 
@@ -246,6 +297,9 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](SECURITY-
     "MaxImageHeight": 10000,
     "MaxImagePixels": 40000000
   },
+  "FileDownload": {
+    "TokenLifetimeMinutes": 15
+  },
   "VirusScan": {
     "Enabled": false,
     "WindowsDefender": {
@@ -271,6 +325,7 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](SECURITY-
 | `FileUpload:KeyDerivation:Argon2id:*` | Tune for your CPU/RAM budget. Library logs derivation time at startup. |
 | `FileUpload:KeyDerivation:LegacyKekFallback` | `true` (default) keeps PBKDF2 fallback KEKs available for *decryption only*. Set `false` after every file has been re-wrapped. |
 | `FileUpload:RecompressImages` | `true` (default) strips polyglot tails by re-encoding JPEG/PNG/WebP through ImageSharp. |
+| `FileDownload:TokenLifetimeMinutes` | Lifetime for opaque download tokens issued by `IFileAccessTokenService`. Default 15 minutes; max 24 hours. |
 | `VirusScan:Enabled` | When `false`, Layer 7 is bypassed. Layers 1–6 + 8 still run. |
 | `VirusScan:ClamAv:MaxStreamBytes` | Must align with `StreamMaxLength` in your `clamd.conf`. |
 
@@ -301,11 +356,12 @@ The scanner is selected automatically by `AddSecureFileUpload()` based on `Opera
 | `src/FileContentValidator.cs` | Layer 6 deep validation. JPEG / PNG / WebP structural walking, PDF pattern scan, FlateDecode-compressed PDF stream inspection (Gap 2). Fail-closed on unknown types. |
 | `src/WindowsDefenderScanService.cs` | Layer 7 — Windows Defender `MpCmdRun.exe`. Secure-delete (zero-before-delete) of temp files. |
 | `src/ClamAvScanService.cs` | Layer 7 — `clamd` over TCP using `zINSTREAM`. No temp file is written. Cross-platform. |
-| `src/SecureFileDownloadController.cs` | Reference hardened download surface. `Content-Disposition: attachment`, strict CSP, COOP/COEP/CORP, re-checks path traversal. |
+| `src/FileAccessTokenService.cs` | Opaque, signed, time-limited download tokens backed by ASP.NET Core Data Protection. |
+| `src/SecureFileDownloadController.cs` | Reference hardened download surface. Tokenized file reference, `Content-Disposition: attachment`, strict CSP, COOP/COEP/CORP, re-checks resolved path traversal. |
 | `src/DependencyInjection/SecureFileUploadServiceCollectionExtensions.cs` | `AddSecureFileUpload()` one-liner DI registration. |
 | `src/Utilities/PathHelper.cs` | Canonicalized `IsPathUnderBase` — defeats the `string.StartsWith("/uploads")` prefix-confusion bug. |
 | `tests/Fuzz/` | SharpFuzz + AFL++ harness for `FileContentValidator.ValidateAsync`. |
-| `tests/SmokeTest/` | Runtime smoke test — Argon2id round-trip, v2 envelope, legacy PBKDF2 fallback, misconfig guard. Run with `dotnet run --project tests/SmokeTest -c Release` before publishing. |
+| `tests/SmokeTest/` | Runtime smoke test — Argon2id round-trip, v2 envelope, legacy PBKDF2 fallback, misconfig guard. Executed in CI and runnable locally with `dotnet run --project tests/SmokeTest -c Release`. |
 
 ---
 
@@ -324,7 +380,7 @@ The scanner is selected automatically by `AddSecureFileUpload()` based on `Opera
 
 Publishing is handled by GitHub Actions in `.github/workflows/nuget-publish.yml`.
 
-- Push to `main` runs build, pack, and a fuzz-harness build — no publish.
+- Push to `main` runs library build, solution tests, the runtime smoke harness, pack, and a fuzz-harness build — no publish.
 - Push a `v*` tag to publish to NuGet.org. The workflow derives the package version from the tag (`v2.0.0` → `2.0.0`).
 - `--skip-duplicate` is used, so re-running on an existing version is non-destructive.
 

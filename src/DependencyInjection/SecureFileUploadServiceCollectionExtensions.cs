@@ -16,6 +16,8 @@ namespace SecureFileUpload.Services
         ///   <item><see cref="IVirusScanService"/> — implementation chosen by platform:
         ///     <see cref="WindowsDefenderScanService"/> on Windows,
         ///     <see cref="ClamAvScanService"/> on Linux / macOS / containers.</item>
+        ///   <item><see cref="IFileAccessTokenService"/> — issues opaque, time-limited
+        ///     download tokens so client-visible URLs do not expose storage paths.</item>
         ///   <item><see cref="IFileUploadService"/> / <see cref="FileUploadService"/>
         ///     (pipeline orchestrator, Layers 1–8)</item>
         /// </list>
@@ -40,6 +42,8 @@ namespace SecureFileUpload.Services
             this IServiceCollection services,
             Action<FileContentValidatorOptions>? configureValidator = null)
         {
+            services.AddDataProtection();
+
             // Validator options — honour appsettings by default; allow inline override.
             if (configureValidator != null)
                 services.Configure(configureValidator);
@@ -58,6 +62,9 @@ namespace SecureFileUpload.Services
 
             // Layers 1–8 orchestrator
             services.AddSingleton<IFileUploadService, FileUploadService>();
+
+            // Hardened download-token issue / resolution
+            services.AddSingleton<IFileAccessTokenService, FileAccessTokenService>();
 
             return services;
         }

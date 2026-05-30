@@ -17,10 +17,10 @@
 
     <!-- ── NuGet package metadata ─────────────────────────────────────── -->
     <PackageId>SecureFileUpload.Core</PackageId>
-    <Version>2.0.0</Version>
-    <AssemblyVersion>2.0.0.0</AssemblyVersion>
-    <FileVersion>2.0.0.0</FileVersion>
-    <InformationalVersion>2.0.0</InformationalVersion>
+    <Version>3.0.0</Version>
+    <AssemblyVersion>3.0.0.0</AssemblyVersion>
+    <FileVersion>3.0.0.0</FileVersion>
+    <InformationalVersion>3.0.0</InformationalVersion>
     <Authors>Paul Clark (systemslibrarian)</Authors>
     <Company>systemslibrarian</Company>
     <Product>SecureFileUpload.Core</Product>
@@ -36,35 +36,30 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryBranch>main</RepositoryBranch>
     <PackageReleaseNotes>
-v2.0.0 — first stable release of the modernized line.
+v3.0.0 — hardened download-surface release.
 
-BREAKING CHANGES vs. 1.0.0:
-  • Target framework moved from net8.0 to net10.0 only. Consumers on net8.0
-    must either upgrade their runtime or pin to 1.0.0 (the prior stable).
-  • Master Key Encryption Key (KEK) derivation defaults to Argon2id (RFC 9106;
-    m=64 MiB, t=3, p=4) instead of PBKDF2-SHA256. Files written by 1.0.0 still
-    decrypt automatically when FileUpload:KeyDerivation:LegacyKekFallback=true
-    (the default) — no migration step required. New writes use the Argon2id KEK.
-  • New required configuration namespace FileUpload:KeyDerivation:* with sensible
-    defaults. Pre-existing FileUpload:* keys are unchanged.
+BREAKING CHANGES vs. 2.0.0:
+  • The reference download endpoint now accepts an opaque `fileToken` instead
+    of a storage-relative `relativePath` query parameter. Consumers must issue
+    tokens via `IFileAccessTokenService.CreateToken(...)` and pass that token to
+    `/staff/files/download?fileToken=...`.
+  • `AddSecureFileUpload()` now registers `IFileAccessTokenService` and the
+    reference controller/docs assume tokenized download links rather than
+    path-based file references.
 
 Highlights:
-  • Memory-hard Argon2id KEK derivation (OWASP 2024+ recommendation). Memory-
-    hardness raises GPU/ASIC brute-force cost-per-guess by orders of magnitude
-    over the prior PBKDF2-SHA256 derivation.
-  • Configurable KDF: Argon2id (default) or Pbkdf2 (FIPS-restricted environments).
-    Argon2id parameters and PBKDF2 iteration count tunable from appsettings.json.
-  • Online-safe upgrade: PBKDF2-derived legacy KEKs (600 000 and 210 000 iterations)
-    are tried during decryption only. No file on disk is bricked by the upgrade.
-  • Packaging: deterministic build, Source Link, snupkg symbols, README + LICENSE
-    + SECURITY-ANALYSIS + KNOWN-GAPS bundled inside the package.
-  • Documentation: full code-traced Implementation &amp; Crypto Posture table,
-    honest residual-risk list, and FIPS-posture statement in README and
-    SECURITY-ANALYSIS.md.
+  • Opaque, signed, time-limited download tokens backed by ASP.NET Core Data
+    Protection. Staff-facing URLs no longer expose storage-relative paths.
+  • Release validation now includes solution tests plus the runtime smoke harness
+    before pack/publish.
+  • Regression coverage expanded for download authorization, token tampering,
+    infected-file rejection, scanner fail-open semantics, and storage-root token
+    enforcement.
+  • Scanner outage logging now matches the actual `NotScanned` fail-open pipeline
+    behavior, avoiding misleading fail-closed wording in production logs.
 
-The 8-layer upload pipeline itself is unchanged — the validation, scanning,
-and on-disk envelope format are byte-for-byte identical to preview.2 and
-preview.3, which were the candidates for this release.
+The 8-layer upload pipeline, on-disk envelope formats, and Argon2id / PBKDF2
+decryption compatibility are unchanged from 2.0.0.
     </PackageReleaseNotes>
 
     <!-- ── Source Link, deterministic build, symbols ───────────────────── -->

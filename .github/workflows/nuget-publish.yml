@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  # ── Build + verify the library compiles cleanly ───────────────────────
+  # ── Build, test, smoke, and pack the package ──────────────────────────
   build:
     name: Build & Pack
     runs-on: ubuntu-latest
@@ -49,11 +49,17 @@ jobs:
           echo "package_version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
           echo "Using package version: $PACKAGE_VERSION"
 
-      - name: Restore
-        run: dotnet restore src/SecureFileUpload.Core.csproj
+      - name: Restore solution
+        run: dotnet restore secure-file-upload-dotnet.sln
 
       - name: Build (Release)
-        run: dotnet build src/SecureFileUpload.Core.csproj --configuration Release --no-restore
+        run: dotnet build secure-file-upload-dotnet.sln --configuration Release --no-restore
+
+      - name: Run solution tests
+        run: dotnet test secure-file-upload-dotnet.sln --configuration Release --no-build
+
+      - name: Run smoke harness
+        run: dotnet run --project tests/SmokeTest/SmokeTest.csproj --configuration Release --no-build
 
       - name: Pack
         run: >

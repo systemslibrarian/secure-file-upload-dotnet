@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Net.Http.Headers;
 using SecureFileUpload.Utilities;
@@ -30,20 +31,24 @@ namespace SecureFileUpload.Services
     ///     `X-Frame-Options: DENY` and `frame-ancestors 'none'`.
     ///   • Cached decrypted patron documents on shared/proxy server → blocked by
     ///     `Cache-Control: no-store, private`.
-    ///   • Path-traversal via `?file=../../etc/passwd` → blocked by `IsPathUnderBase`
-    ///     re-check inside the handler (defence-in-depth on top of upload-time check).
+    ///   • Tampered token resolves outside the storage root → blocked by token
+    ///     validation plus `IsPathUnderBase` re-check inside the handler.
     ///   • Filename injection in `Content-Disposition` header (CRLF / quote escape)
     ///     → blocked by RFC 6266 `filename*` UTF-8 encoding via `ContentDispositionHeaderValue`.
     ///
     /// Usage:
-    ///   Wire this controller (or an action with an equivalent shape) under an
-    ///   authenticated, authorised, MFA-gated staff route. Do NOT expose anonymously.
+    ///   This controller requires an authenticated user by default via
+    ///   <see cref="AuthorizeAttribute"/>. Consumers should still place it behind
+    ///   an authorised, MFA-gated staff route and apply their own policy/role
+    ///   requirements for least privilege. Do NOT expose anonymously.
     /// </summary>
+    [Authorize]
     [ApiController]
     [Route("staff/files")]
     public sealed class SecureFileDownloadController : ControllerBase
     {
         private readonly IFileUploadService _uploadService;
+        private readonly IFileAccessTokenService _fileAccessTokenService;
         private readonly ILogger<SecureFileDownloadController> _logger;
 
         // Only these content types are ever returned. Anything else is forced to
@@ -53,47 +58,35 @@ namespace SecureFileUpload.Services
 
         public SecureFileDownloadController(
             IFileUploadService uploadService,
+            IFileAccessTokenService fileAccessTokenService,
             ILogger<SecureFileDownloadController> logger)
         {
             _uploadService = uploadService;
+            _fileAccessTokenService = fileAccessTokenService;
             _logger = logger;
         }
 
         /// <summary>
         /// Downloads a decrypted file as an attachment with locked-down response headers.
-        /// `relativePath` is interpreted relative to the configured StorageRoot and
-        /// re-validated inside the handler.
+        /// `fileToken` is an opaque, signed file reference created by
+        /// <see cref="IFileAccessTokenService"/>. The token resolves to an absolute
+        /// stored file path under <see cref="IFileUploadService.StorageRoot"/>.
         /// </summary>
         [HttpGet("download")]
-        public async Task<IActionResult> Download([FromQuery] string relativePath)
+        public async Task<IActionResult> Download([FromQuery] string fileToken)
         {
-            // ── 1. Reject obviously hostile input before any IO. ────────────────
-            if (string.IsNullOrWhiteSpace(relativePath) ||
-                relativePath.Contains("..", StringComparison.Ordinal) ||
-                relativePath.Contains('\0') ||
-                relativePath.Contains('\r') ||
-                relativePath.Contains('\n') ||
-                Path.IsPathRooted(relativePath))
+            // ── 1. Reject missing / malformed / expired token input. ───────────
+            if (string.IsNullOrWhiteSpace(fileToken) ||
+                !_fileAccessTokenService.TryResolveStoredFilePath(fileToken, out string? fullPath) ||
+                string.IsNullOrWhiteSpace(fullPath))
             {
                 _logger.LogWarning(
-                    "SECURITY_EVENT | DOWNLOAD_REJECTED_BAD_INPUT | RawInput: {Input}",
-                    SanitizeForLog(relativePath));
+                    "SECURITY_EVENT | DOWNLOAD_REJECTED_BAD_TOKEN");
                 return BadRequest("Invalid file reference.");
             }
 
-            // ── 2. Resolve and re-check it lands under the validated StorageRoot. ─
+            // ── 2. Re-check the resolved path lands under the validated StorageRoot. ─
             var storageRoot = _uploadService.StorageRoot;
-            string fullPath;
-            try
-            {
-                fullPath = Path.GetFullPath(Path.Combine(storageRoot, relativePath));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "DOWNLOAD_PATH_RESOLVE_FAILED | Input: {Input}", SanitizeForLog(relativePath));
-                return BadRequest("Invalid file reference.");
-            }
-
             if (!PathHelper.IsPathUnderBase(fullPath, storageRoot))
             {
                 _logger.LogWarning(
@@ -196,7 +189,8 @@ namespace SecureFileUpload.Services
             h["Pragma"] = "no-cache";
             h["Expires"] = "0";
 
-            // Don't leak the staff URL (which contains the storage path) to other origins.
+            // Don't leak the staff URL (which contains an opaque download token)
+            // to other origins.
             h["Referrer-Policy"] = "no-referrer";
 
             // Disable browser features the response has no business using.
