@@ -1,3 +1,4 @@
+using Konscious.Security.Cryptography;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
@@ -106,8 +107,9 @@ namespace SecureFileUpload.Services
         private readonly long _minTempFreeBytes;
         private readonly long _lowDiskWarningBytes;
         private readonly bool _encryptionEnabled;
-        private readonly byte[]? _encryptionKey;       // 32-byte AES-256 master/KEK (PBKDF2-derived)
-        private readonly byte[]? _legacyEncryptionKey; // Optional fallback key for legacy PBKDF2 iteration counts
+        private readonly byte[]? _encryptionKey;       // 32-byte AES-256 master/KEK (Argon2id-derived by default; PBKDF2 if KeyDerivation:Algorithm=Pbkdf2)
+        private readonly IReadOnlyList<byte[]> _legacyEncryptionKeys; // Decrypt-only fallback KEKs (legacy PBKDF2 iteration counts, or prior algorithm)
+        private readonly string _kdfAlgorithmLabel;    // "Argon2id" or "PBKDF2-SHA256" — for logging only
         private readonly bool _virusScanEnabled;       // mirrors VirusScan:Enabled in appsettings
         private readonly bool _recompressImages;       // Gap 1 mitigation — strips polyglot tails on write
         private readonly int _jpegRecompressQuality;   // 1–100, default 95
@@ -138,6 +140,29 @@ namespace SecureFileUpload.Services
         private const int DekSize       = 32;  // 256-bit per-file Data Encryption Key
         private const int GcmV1HeaderSize = 8 + GcmNonceSize + GcmTagSize;                         // 36
         private const int GcmV2HeaderSize = 8 + GcmNonceSize + GcmTagSize + DekSize + GcmNonceSize + GcmTagSize; // 96
+
+        // ── KDF constants ───────────────────────────────────────────────
+        //
+        // Fixed application-level salts. These are public knowledge by design —
+        // the KDF's strength is the secret + the memory-hard work factor, not
+        // the obscurity of the salt. Bumping the suffix is a deliberate KEK
+        // rotation event: existing files become readable only via the legacy
+        // fallback path until they are re-wrapped.
+        //
+        private static readonly byte[] Argon2idSalt = Encoding.UTF8.GetBytes("SecureFileUpload.kdf.argon2id.v1");
+        private static readonly byte[] LegacyPbkdf2Salt = Encoding.UTF8.GetBytes("SecureFileUpload.FileUpload.v1");
+
+        // Default Argon2id parameters — OWASP 2024+ server-side, RFC 9106 recommendation.
+        // Target ~250–500 ms KEK derivation on a modern x64 server core at startup.
+        private const int DefaultArgon2idMemoryKiB = 64 * 1024; // 64 MiB
+        private const int DefaultArgon2idIterations = 3;
+        private const int DefaultArgon2idParallelism = 4;
+
+        // Default PBKDF2 iteration count (OWASP 2024 recommendation for SHA-256).
+        // Used when KeyDerivation:Algorithm = "Pbkdf2" (FIPS-restricted environments)
+        // and as the highest-iteration legacy KEK for backward-compatible decryption.
+        private const int DefaultPbkdf2Iterations = 600_000;
+        private const int LegacyPbkdf2IterationsOld = 210_000; // pre-OWASP-bump count
 
         // ── Allowlists ───────────────────────────────────────────────────
 
@@ -311,6 +336,9 @@ namespace SecureFileUpload.Services
                 _configuration.GetValue<int>("FileUpload:JpegRecompressQuality", 95), 1, 100);
 
             _encryptionEnabled = _configuration.GetValue<bool>("FileUpload:EncryptionEnabled", false);
+            _kdfAlgorithmLabel = "disabled";
+            _legacyEncryptionKeys = Array.Empty<byte[]>();
+
             if (_encryptionEnabled)
             {
                 var secret = _configuration["FileUpload:EncryptionSecret"];
@@ -327,44 +355,138 @@ namespace SecureFileUpload.Services
                         "Refusing to start to prevent unencrypted patron document storage.");
                 }
 
-                // Derive a 256-bit key using PBKDF2-SHA256 with a fixed application salt
-                // and 600,000 iterations (OWASP 2024 recommendation for PBKDF2-SHA256).
-                // The salt is application-specific (not per-file) because all files share
-                // one key; the iteration count provides brute-force resistance if the
-                // secret is weak or the config store is compromised.
-                var salt = Encoding.UTF8.GetBytes("SecureFileUpload.FileUpload.v1");
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                _encryptionKey = Rfc2898DeriveBytes.Pbkdf2(
-                    Encoding.UTF8.GetBytes(secret),
-                    salt,
-                    iterations: 600_000,
-                    HashAlgorithmName.SHA256,
-                    outputLength: 32);
-                sw.Stop();
-                _logger.LogInformation(
-                    "Encryption key derived in {ElapsedMs}ms ({Iterations:N0} PBKDF2-SHA256 iterations)",
-                    sw.ElapsedMilliseconds, 600_000);
+                // ── KEK derivation ────────────────────────────────────
+                //
+                // v1.0.0: the master Key Encryption Key (KEK) is derived via
+                // Argon2id by default — the memory-hard KDF recommended by
+                // RFC 9106 and the OWASP 2024+ Password Storage Cheat Sheet.
+                //
+                // Why Argon2id (not PBKDF2)? PBKDF2-SHA256 at 600 000 iterations
+                // is still acceptable per OWASP, but it is CPU-only — GPU and
+                // ASIC implementations can brute-force candidate passwords at
+                // rates far higher than a defender's server can derive a key.
+                // Argon2id forces an attacker to allocate `MemoryKiB` RAM per
+                // concurrent guess, which raises the per-guess cost by orders
+                // of magnitude on GPUs and closes the ASIC advantage.
+                //
+                // PBKDF2-SHA256 remains selectable via KeyDerivation:Algorithm
+                // for FIPS-restricted deployments (Argon2id is not in FIPS 140-3
+                // ASMs as of 2026). Existing files wrapped under any prior KEK
+                // are still readable via the LegacyKekFallback list below; no
+                // file on disk is bricked by this upgrade.
+                //
+                var algorithm = (_configuration["FileUpload:KeyDerivation:Algorithm"] ?? "Argon2id").Trim();
+                var passwordBytes = Encoding.UTF8.GetBytes(secret);
 
-                // Backward-compatibility fallback for files encrypted under the
-                // previous 210,000-iteration count before the OWASP bump.
-                _legacyEncryptionKey = Rfc2898DeriveBytes.Pbkdf2(
-                    Encoding.UTF8.GetBytes(secret),
-                    salt,
-                    iterations: 210_000,
-                    HashAlgorithmName.SHA256,
-                    outputLength: 32);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (string.Equals(algorithm, "Pbkdf2", StringComparison.OrdinalIgnoreCase))
+                {
+                    var pbkdf2Iterations = _configuration.GetValue<int>(
+                        "FileUpload:KeyDerivation:Pbkdf2:Iterations", DefaultPbkdf2Iterations);
+                    _encryptionKey = Rfc2898DeriveBytes.Pbkdf2(
+                        passwordBytes, LegacyPbkdf2Salt, pbkdf2Iterations, HashAlgorithmName.SHA256, 32);
+                    _kdfAlgorithmLabel = $"PBKDF2-SHA256 (iter={pbkdf2Iterations:N0})";
+                    sw.Stop();
+                    _logger.LogInformation(
+                        "KDF_PBKDF2_DERIVED | ElapsedMs={ElapsedMs} | Iterations={Iterations:N0}",
+                        sw.ElapsedMilliseconds, pbkdf2Iterations);
+                }
+                else
+                {
+                    // Argon2id is the default.
+                    var memoryKiB = _configuration.GetValue<int>(
+                        "FileUpload:KeyDerivation:Argon2id:MemoryKiB", DefaultArgon2idMemoryKiB);
+                    var iterations = _configuration.GetValue<int>(
+                        "FileUpload:KeyDerivation:Argon2id:Iterations", DefaultArgon2idIterations);
+                    var parallelism = _configuration.GetValue<int>(
+                        "FileUpload:KeyDerivation:Argon2id:Parallelism", DefaultArgon2idParallelism);
+
+                    _encryptionKey = DeriveArgon2idKey(passwordBytes, Argon2idSalt, memoryKiB, iterations, parallelism, 32);
+                    _kdfAlgorithmLabel = $"Argon2id (m={memoryKiB}KiB, t={iterations}, p={parallelism})";
+                    sw.Stop();
+                    _logger.LogInformation(
+                        "KDF_ARGON2ID_DERIVED | ElapsedMs={ElapsedMs} | MemoryKiB={MemoryKiB} | Iterations={Iterations} | Parallelism={Parallelism}",
+                        sw.ElapsedMilliseconds, memoryKiB, iterations, parallelism);
+                }
+
+                // ── Legacy KEK fallback (decrypt-only) ────────────────
+                //
+                // Files written by earlier versions of this library were wrapped
+                // under PBKDF2-SHA256 KEKs. To avoid bricking existing data, we
+                // derive those KEKs too and try them in order during decryption.
+                // New writes always use _encryptionKey (the primary KEK derived
+                // by the configured Algorithm above).
+                //
+                // Operators who have re-wrapped every file under the new KEK can
+                // set FileUpload:KeyDerivation:LegacyKekFallback=false to disable
+                // this fallback list entirely.
+                //
+                var legacyKekFallback = _configuration.GetValue<bool>(
+                    "FileUpload:KeyDerivation:LegacyKekFallback", true);
+
+                if (legacyKekFallback)
+                {
+                    var legacy = new List<byte[]>(capacity: 2);
+
+                    // Only add PBKDF2 fallbacks if Argon2id is the primary —
+                    // when PBKDF2 is the primary, the 600k key is _encryptionKey itself.
+                    if (!string.Equals(algorithm, "Pbkdf2", StringComparison.OrdinalIgnoreCase))
+                    {
+                        legacy.Add(Rfc2898DeriveBytes.Pbkdf2(
+                            passwordBytes, LegacyPbkdf2Salt, DefaultPbkdf2Iterations, HashAlgorithmName.SHA256, 32));
+                    }
+
+                    // 210 000-iteration legacy key (pre-OWASP-bump).
+                    legacy.Add(Rfc2898DeriveBytes.Pbkdf2(
+                        passwordBytes, LegacyPbkdf2Salt, LegacyPbkdf2IterationsOld, HashAlgorithmName.SHA256, 32));
+
+                    _legacyEncryptionKeys = legacy;
+                    _logger.LogInformation(
+                        "KDF_LEGACY_FALLBACK_ENABLED | LegacyKekCount={Count} | Decrypt-only — new writes use primary KEK ({Primary})",
+                        legacy.Count, _kdfAlgorithmLabel);
+                }
+                else
+                {
+                    _logger.LogInformation(
+                        "KDF_LEGACY_FALLBACK_DISABLED | Files wrapped under prior KEKs will not decrypt.");
+                }
+
+                // Wipe the password buffer — it served its single purpose.
+                CryptographicOperations.ZeroMemory(passwordBytes);
             }
 
             _logger.LogInformation(
                 "FileUploadService initialized | StorageRoot: {Path} | MaxSize: {Size}MB | MaxCount: {Count} | MaxTotal: {TotalMB}MB | " +
                 "MinStorageFree: {MinStorageMB}MB | MinTempFree: {MinTempMB}MB | LowDiskWarn: {WarnMB}MB | " +
-                "Encryption: {Enc} | Recompress: {RC} | DeepValidation: enabled | VirusScan: {VS} ({Scanner})",
+                "Encryption: {Enc} | KDF: {Kdf} | Recompress: {RC} | DeepValidation: enabled | VirusScan: {VS} ({Scanner})",
                 _storageRoot, _maxFileSizeBytes / 1024 / 1024, _maxFileCount, _maxTotalUploadBytes / 1024 / 1024,
                 _minStorageFreeBytes / 1024 / 1024, _minTempFreeBytes / 1024 / 1024, _lowDiskWarningBytes / 1024 / 1024,
                 _encryptionEnabled ? "AES-256-GCM (envelope/v2)" : "disabled",
+                _kdfAlgorithmLabel,
                 _recompressImages ? $"enabled (JPEG q={_jpegRecompressQuality})" : "disabled",
                 _virusScanEnabled ? "enabled" : "disabled",
                 _virusScanService.ScannerName);
+        }
+
+        /// <summary>
+        /// Derives a key of the requested length from <paramref name="password"/> using Argon2id
+        /// (memory-hard KDF; RFC 9106). Used to derive the master Key Encryption Key (KEK)
+        /// from the configured EncryptionSecret. Caller owns and is responsible for zeroing
+        /// the returned buffer when it is no longer needed.
+        /// </summary>
+        private static byte[] DeriveArgon2idKey(
+            byte[] password, byte[] salt,
+            int memoryKiB, int iterations, int parallelism,
+            int outputLength)
+        {
+            using var argon2 = new Argon2id(password)
+            {
+                Salt = salt,
+                DegreeOfParallelism = parallelism,
+                MemorySize = memoryKiB,
+                Iterations = iterations,
+            };
+            return argon2.GetBytes(outputLength);
         }
 
         // ── Public surface ───────────────────────────────────────────────
@@ -768,19 +890,31 @@ namespace SecureFileUpload.Services
             var fileTag    = rawBytes.AsSpan(offset, GcmTagSize).ToArray();     offset += GcmTagSize;
             var ciphertext = rawBytes.AsSpan(offset).ToArray();
 
+            // Primary KEK first (Argon2id-derived by default, or PBKDF2 if explicitly configured).
             byte[]? dek = TryUnwrapDek(wrappedDek, dekNonce, dekTag, _encryptionKey!);
-            if (dek == null && _legacyEncryptionKey != null)
+
+            // Then walk the legacy fallback list. This makes the upgrade from PBKDF2 → Argon2id
+            // online-safe: files wrapped under prior KEKs continue to decrypt without re-encrypting.
+            if (dek == null)
             {
-                dek = TryUnwrapDek(wrappedDek, dekNonce, dekTag, _legacyEncryptionKey);
-                if (dek != null)
-                    _logger.LogInformation("FILE_DECRYPT_KEK_LEGACY | DEK unwrapped with legacy KEK. Path: {Path}", filePath);
+                for (int i = 0; i < _legacyEncryptionKeys.Count; i++)
+                {
+                    dek = TryUnwrapDek(wrappedDek, dekNonce, dekTag, _legacyEncryptionKeys[i]);
+                    if (dek != null)
+                    {
+                        _logger.LogInformation(
+                            "FILE_DECRYPT_KEK_LEGACY | DEK unwrapped with legacy KEK index {Index}. Path: {Path}",
+                            i, filePath);
+                        break;
+                    }
+                }
             }
 
             if (dek == null)
             {
                 _logger.LogError(
-                    "FILE_DECRYPT_KEK_FAIL | DEK unwrap failed for all configured master keys. Path: {Path}",
-                    filePath);
+                    "FILE_DECRYPT_KEK_FAIL | DEK unwrap failed for all configured master keys (primary + {LegacyCount} legacy). Path: {Path}",
+                    _legacyEncryptionKeys.Count, filePath);
                 return (null, contentType);
             }
 
@@ -825,17 +959,24 @@ namespace SecureFileUpload.Services
 
             byte[]? plaintext = TryDecryptGcm(ciphertext, nonce, tag, _encryptionKey!);
             string keyUsed = "current";
-            if (plaintext == null && _legacyEncryptionKey != null)
+            if (plaintext == null)
             {
-                plaintext = TryDecryptGcm(ciphertext, nonce, tag, _legacyEncryptionKey);
-                keyUsed = "legacy";
+                for (int i = 0; i < _legacyEncryptionKeys.Count; i++)
+                {
+                    plaintext = TryDecryptGcm(ciphertext, nonce, tag, _legacyEncryptionKeys[i]);
+                    if (plaintext != null)
+                    {
+                        keyUsed = $"legacy[{i}]";
+                        break;
+                    }
+                }
             }
 
             if (plaintext == null)
             {
                 _logger.LogError(
-                    "FILE_DECRYPT_ERROR | v1 authentication failed for all configured keys. Path: {Path}",
-                    filePath);
+                    "FILE_DECRYPT_ERROR | v1 authentication failed for all configured keys (primary + {LegacyCount} legacy). Path: {Path}",
+                    _legacyEncryptionKeys.Count, filePath);
                 return (null, contentType);
             }
 

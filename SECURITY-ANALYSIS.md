@@ -7,6 +7,8 @@
 **Methodology:** Code-first: every claim below traces to a specific line in `src/`. Where the original red-team findings differ from the current code state, both are recorded.  
 **Verdict:** Production-grade for the stated use case (patron document intake); a small number of design-level trade-offs require conscious deployment decisions
 
+> **v1.0.0 modernization:** master-KEK derivation has been migrated from PBKDF2-SHA256 (600 000 iterations) to **Argon2id** (memory-hard, RFC 9106). Default parameters: `m=64 MiB, t=3, p=4`. PBKDF2-derived KEKs remain valid *for decryption only* (controlled by `FileUpload:KeyDerivation:LegacyKekFallback`, default `true`) so existing files on disk continue to open after the upgrade. New writes always use the Argon2id-derived KEK. The target framework is now `net10.0` only.
+
 This document was produced by running a structured adversarial code review — the reviewer was asked to find real weaknesses, not to validate the design. The original findings are preserved below with current resolution status. A new section records behavioral findings discovered during the post-NuGet code audit.
 
 ---
@@ -47,11 +49,48 @@ Layer 7  Virus scan (IVirusScanService):
            Availability fail-open: scanner down → accept as NotScanned (see Gap 9)
            Disabled entirely when VirusScan:Enabled=false
 Layer 8  Storage:
-           AES-256-GCM envelope encryption (v2): random per-file DEK wrapped under PBKDF2-SHA256 KEK
+           AES-256-GCM envelope encryption (v2): random per-file DEK wrapped under Argon2id-derived KEK
+           PBKDF2-SHA256 KEKs remain valid for decryption only (LegacyKekFallback, default on)
            Image recompression to strip polyglot tails (default on)
            Path traversal re-check at write time via PathHelper.IsPathUnderBase
            Stored outside wwwroot; no direct web serving
 ```
+
+## Implementation & Crypto Posture (v1.0.0)
+
+This section names the primitives, parameters, and residual risks. It is the single source of truth for the cryptographic posture; the README has a friendlier summary.
+
+| Aspect | Implementation | Source of truth |
+|---|---|---|
+| Symmetric AEAD | AES-256-GCM, 96-bit nonce, 128-bit tag | `System.Security.Cryptography.AesGcm`; NIST SP 800-38D / RFC 5288 |
+| Encryption scheme | Envelope (v2): per-file random 256-bit DEK, KEK-wrapped | `FileUploadService.WriteEnvelopeEncryptedAsync` |
+| KEK derivation (writes) | **Argon2id**, `m=64 MiB, t=3, p=4`, 16-byte fixed application salt | `Konscious.Security.Cryptography.Argon2` 1.3.x; RFC 9106; OWASP 2024+ |
+| KEK derivation (decrypt fallback) | PBKDF2-SHA256, 600 000 and 210 000 iterations (legacy) | `Rfc2898DeriveBytes.Pbkdf2`; OWASP 2024 |
+| RNG | `RandomNumberGenerator.Fill` / `GetInt32` (CSPRNG) | DEKs, nonces, filename suffixes |
+| Buffer hygiene | `CryptographicOperations.ZeroMemory` on plaintext, DEK, and KEK buffers in `finally` blocks | `FileUploadService` |
+| Format markers | `ENCGCM\0\x01` (legacy single-key) and `ENCGCM\0\x02` (current envelope) | `FileUploadService` constants |
+| Startup guards | `EncryptionEnabled=true` + missing/placeholder secret → `InvalidOperationException` at construction time | `FileUploadService` constructor |
+| FIPS posture | **Not FIPS-validated.** Argon2id is not part of FIPS 140-3 ASMs as of 2026. Opt into `KeyDerivation:Algorithm = "Pbkdf2"` for FIPS-only deployments. | Configurable |
+
+### Why Argon2id replaced PBKDF2 in v1.0.0
+
+PBKDF2-SHA256 at 600 000 iterations is still acceptable per OWASP, but it is CPU-only — purpose-built GPU and ASIC implementations can brute-force candidate passwords at rates far higher than a defender's server can derive a key. Argon2id is **memory-hard**: a worthwhile attack requires the attacker to allocate `MemoryKiB` of RAM per concurrent guess, raising the cost-per-guess by orders of magnitude on GPUs and effectively closing the ASIC advantage. RFC 9106 and the 2024+ OWASP Password Storage Cheat Sheet both list Argon2id as the recommended default for password-based KDFs.
+
+Because all existing on-disk files were encrypted with DEKs wrapped under the previous PBKDF2 KEK, simply switching the algorithm would brick them. The library handles this by:
+
+1. **Writes:** always use the Argon2id-derived KEK.
+2. **Reads:** try the Argon2id KEK first; on AEAD-tag failure, try each PBKDF2 fallback KEK in `FileUpload:KeyDerivation` (gated by `LegacyKekFallback=true`).
+3. **Migration path:** operators who want to retire the PBKDF2 fallbacks can re-wrap every file's DEK under the Argon2id KEK using the standard rotate operation (write the file's plaintext back through the pipeline; payload unchanged), then set `LegacyKekFallback: false`.
+
+The migration is online-safe — there is no period during which an existing file becomes unreadable.
+
+### Honest limitations of the current crypto posture
+
+- **The salt is in source.** `"SecureFileUpload.kdf.argon2id.v1"` is identical across deployments of this library version. The protection model assumes the *secret* lives in a real secrets manager.
+- **Argon2id is not FIPS-validated.** Compliance-bound deployments must select `Pbkdf2` explicitly.
+- **The KEK lives in process memory.** A memory-disclosure or core-dump capability on the host bypasses the KDF entirely. Mitigations are deployment-level (least privilege, ASLR, sealed VMs, confidential compute).
+- **No HSM / KMS integration in v1.** A KMS-backed KEK is the right next step for high-assurance deployments and is tracked in `docs/hardening-roadmap.md`.
+- **Argon2id resource cost is sized for a "modern x64 server core."** On a small container or burstable VM, startup KEK derivation may take noticeably longer than the ~250–500 ms target. The library emits `KDF_ARGON2ID_DERIVED | ElapsedMs=...` at startup so this is measurable in production.
 
 At download time, `SecureFileDownloadController` independently re-checks path traversal, forces `Content-Disposition: attachment`, and sets a complete hardened header set (`X-Content-Type-Options`, `X-Frame-Options`, `Cache-Control: no-store`, `Content-Security-Policy: default-src 'none'`). Decrypted plaintext never touches the filesystem — it streams directly to the HTTP response.
 
@@ -67,7 +106,7 @@ These are code-verified properties of the current implementation. Each claim tra
 
 **PathHelper.IsPathUnderBase over string.StartsWith.** The `string.StartsWith("/uploads")` prefix-confusion bug is a real, exploited CVE class. `PathHelper.IsPathUnderBase` canonicalizes both paths via `Path.GetFullPath`, trims separators, then checks for exact equality or `base + separator` prefix. A sibling directory `/uploads_evil` cannot match `/uploads`.
 
-**Envelope encryption limits blast radius.** The v2 format generates a random 256-bit DEK per file, encrypts the DEK under the PBKDF2-derived master KEK, and stores only the wrapped DEK on disk. Compromising one file's key material does not affect other files. KEK rotation rewraps only the DEKs; file payloads are not re-encrypted.
+**Envelope encryption limits blast radius.** The v2 format generates a random 256-bit DEK per file, encrypts the DEK under the Argon2id-derived master KEK, and stores only the wrapped DEK on disk. Compromising one file's key material does not affect other files. KEK rotation rewraps only the DEKs; file payloads are not re-encrypted.
 
 **Image recompression strips polyglot tails.** Decoding a JPEG through ImageSharp and re-encoding it drops all data appended after the EOI marker. The re-encoded bytes are what get encrypted to disk. An attacker who appends a PHP shell after a valid JPEG reaches storage with only a valid JPEG — the tail is gone.
 
@@ -119,21 +158,20 @@ The comment claims `ScanSuccessful=false` causes the pipeline to reject the file
 
 **Required fix:** Update both scanner XML doc comments to accurately describe the pipeline behavior: "availability failure is fail-open with explicit NotScanned accounting; detection failure (IsClean=false + ScanSuccessful=true) is fail-closed."
 
-### Risk 3 — Fixed PBKDF2 application salt for master KEK
+### Risk 3 — Fixed application salt for master KEK derivation
 
-**Code location:** `FileUploadService.cs` constructor (~line 340)
+**Code location:** `FileUploadService.cs` constructor
 
 ```csharp
-var salt = Encoding.UTF8.GetBytes("SecureFileUpload.FileUpload.v1");
-_encryptionKey = Rfc2898DeriveBytes.Pbkdf2(
-    Encoding.UTF8.GetBytes(secret), salt, iterations: 600_000, ...);
+private static readonly byte[] KdfSalt = Encoding.UTF8.GetBytes("SecureFileUpload.kdf.argon2id.v1");
+// passed to Argon2id (writes / current reads) and to the PBKDF2 fallback (legacy reads)
 ```
 
 The salt is hard-coded in source. If an attacker obtains the salt (it's in this repo) and the derived key material (e.g., memory dump), they can focus brute-force against the secret alone without needing to discover the salt.
 
-**Context offsetting this risk:** The 600,000-iteration PBKDF2-SHA256 count (OWASP 2024 recommendation) makes brute force expensive. Per-file random DEKs mean key compromise does not give access to all files without the KEK. The practical, higher-probability risk is a weak or committed `EncryptionSecret` — the salt is secondary. The startup guard blocks a missing or placeholder secret.
+**Context offsetting this risk:** Argon2id is memory-hard — `m=64 MiB, t=3, p=4` means each guess requires 64 MiB of RAM for ~250 ms on a modern x64 server core, which is hostile to GPU and ASIC attackers in a way PBKDF2 was not. Per-file random DEKs mean a single-file compromise does not extend to other files without the KEK. The practical, higher-probability risk is still a weak or committed `EncryptionSecret` — the salt is secondary. The startup guard blocks a missing or placeholder secret.
 
-**Recommendation:** Ensure `EncryptionSecret` is stored in environment variables, Azure Key Vault, AWS Secrets Manager, or another external secret store — never in `appsettings.json` checked into source control. See `docs/hardening-roadmap.md §2.1`.
+**Recommendation:** Ensure `EncryptionSecret` is stored in environment variables, Azure Key Vault, AWS Secrets Manager, or another external secret store — never in `appsettings.json` checked into source control. For deployments that need a per-environment salt, override `KdfSalt` via configuration in a future release (tracked in `docs/hardening-roadmap.md §2.1`).
 
 ### Risk 4 — reCAPTCHA disabled
 
@@ -163,7 +201,7 @@ The following are assumed by the codebase. Violating any of them materially degr
 
 | Assumption | Why it matters |
 |---|---|
-| `FileUpload:EncryptionSecret` is stored in a secrets manager, not `appsettings.json` | Fixed salt + committed secret = effectively no key protection |
+| `FileUpload:EncryptionSecret` is stored in a secrets manager, not `appsettings.json` | Fixed salt + committed secret = effectively no key protection (no KDF — Argon2id or otherwise — saves you here) |
 | Storage root is outside `wwwroot` | The constructor checks this, but the web server must be configured to not serve the data directory by other means |
 | Virus scanner is reachable at startup | There is no startup-time scan health check; scanner unavailability at startup is not detected until the first upload |
 | `FileUpload:RecompressImages=true` (default) | With recompression disabled, polyglot tails are not stripped; images are stored byte-exact |
@@ -362,9 +400,9 @@ See `KNOWN-GAPS.md` for why this was not implemented in the original codebase.
 
 ---
 
-### FINDING 3 — LOW — Fixed PBKDF2 Application Salt
+### FINDING 3 — LOW — Fixed KDF Application Salt
 
-> **Status:** Acknowledged. Now applies to the master KEK in the envelope-encryption (v2) scheme — per-file DEKs are random and never derived from the secret. Salt is `"SecureFileUpload.FileUpload.v1"`.
+> **Status:** Acknowledged. As of v1.0.0 the master KEK is derived via **Argon2id** (`m=64 MiB, t=3, p=4`) instead of PBKDF2-SHA256. Per-file DEKs remain random and are never derived from the secret. The salt has been renamed to `"SecureFileUpload.kdf.argon2id.v1"` and is still fixed in source. The risk profile below remains directionally accurate; the cost of brute-force per guess is now substantially higher under Argon2id's memory-hard parameters.
 
 **Location:** `FileUploadService.cs`, constructor
 ```csharp
@@ -375,7 +413,7 @@ _encryptionKey = Rfc2898DeriveBytes.Pbkdf2(
 
 **Finding:** A fixed application-specific salt is used to derive the master encryption key from the configured secret. This is intentional and documented in the code — all files share one derived key, so a random per-file salt doesn't apply here. However, the fixed salt means that if an attacker knows the salt value (it's in source code) and obtains the derived key material (e.g., via memory dump), they can focus brute-force effort on the secret alone without needing to deal with salt discovery.
 
-**Risk:** Low. The 600,000 PBKDF2 iteration count makes brute force expensive. The larger practical risk is secret management — if `EncryptionSecret` is stored in `appsettings.json` in source control (rather than environment variables or a secrets manager), the salt is irrelevant because the secret itself is exposed.
+**Risk:** Low. As of v1.0.0 Argon2id with `m=64 MiB, t=3, p=4` makes brute force expensive on both CPU and GPU/ASIC. The larger practical risk is still secret management — if `EncryptionSecret` is stored in `appsettings.json` in source control (rather than environment variables or a secrets manager), the salt is irrelevant because the secret itself is exposed, regardless of which KDF you use.
 
 **Recommendation:** Ensure `EncryptionSecret` is stored in environment variables, Azure Key Vault, AWS Secrets Manager, or another secrets manager — never in `appsettings.json` committed to source control. Document this prominently in deployment instructions.
 

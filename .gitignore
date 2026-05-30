@@ -5,11 +5,20 @@ obj/
 *.suo
 .vs/
 
+# NuGet pack output (CI publishes from a fresh pack)
+nupkgs/
+nupkgs-test/
+*.nupkg
+*.snupkg
+
 # Secrets — NEVER commit these
 appsettings.Production.json
 appsettings.secrets.json
 *.pfx
 *.key
+nugetkey.txt
+nuget.api.key
+*nugetkey*
 
 # Upload storage — should never be in source control
 uploads/

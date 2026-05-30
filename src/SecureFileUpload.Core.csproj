@@ -1,58 +1,94 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!-- ── Target framework ────────────────────────────────────────────── -->
+    <!--
+      v1.0.0 targets net10.0 only. Earlier .NET targets were dropped to
+      consolidate on a single LTS-class runtime, take advantage of newer
+      crypto APIs, and simplify the dependency surface. If you need
+      net8.0 support, pin to a 1.0.x-preview.0 build of this package.
+    -->
+    <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
     <RootNamespace>SecureFileUpload</RootNamespace>
     <AssemblyName>SecureFileUpload.Core</AssemblyName>
 
     <!-- ── NuGet package metadata ─────────────────────────────────────── -->
     <PackageId>SecureFileUpload.Core</PackageId>
-    <Version>1.0.1-preview.1</Version>
-    <Authors>systemslibrarian</Authors>
-    <Description>
-      Production-grade, defense-in-depth file upload pipeline for ASP.NET Core 8+.
-
-      Provides an 8-layer validation and encrypted-storage pipeline:
-        Layer 1  File size limits (per-file and batch)
-        Layer 2  Extension allowlist (.jpg .jpeg .png .webp .pdf)
-        Layer 3  MIME type ↔ extension cross-validation
-        Layer 4  Magic-byte / file-signature verification
-        Layer 5  Filename inspection (double-extension, Unicode tricks, path traversal)
-        Layer 6  Deep content validation — JPEG/PNG/WebP structural walkers, PDF
-                 pattern scan including FlateDecode-compressed stream inspection
-        Layer 7  Virus scanning via Windows Defender or ClamAV (pluggable IVirusScanService)
-        Layer 8  AES-256-GCM envelope-encrypted storage outside wwwroot,
-                 image recompression to strip polyglot tails
-
-      Includes a reference hardened download controller and a SharpFuzz/AFL++ harness
-      for the deep content validator.
-    </Description>
-    <PackageTags>aspnetcore;security;file-upload;antivirus;clamav;encryption;aes-gcm;validation</PackageTags>
+    <Version>2.0.0</Version>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+    <FileVersion>2.0.0.0</FileVersion>
+    <InformationalVersion>2.0.0</InformationalVersion>
+    <Authors>Paul Clark (systemslibrarian)</Authors>
+    <Company>systemslibrarian</Company>
+    <Product>SecureFileUpload.Core</Product>
+    <Copyright>Copyright (c) 2026 Paul Clark</Copyright>
+    <Title>SecureFileUpload.Core — defense-in-depth file upload for ASP.NET Core 10+</Title>
+    <Description>Defense-in-depth file upload pipeline for ASP.NET Core 10+. An 8-layer validation and encrypted-storage pipeline lifted from a production document-intake workflow: size + batch limits, extension allowlist, MIME / extension cross-check, magic-byte signatures, filename inspection, deep structural content validation (JPEG / PNG / WebP walkers + PDF pattern scan with FlateDecode-compressed stream inspection), pluggable virus scanning (Windows Defender or ClamAV), and AES-256-GCM envelope encryption with a per-file random DEK wrapped under an Argon2id-derived master KEK (RFC 9106 / OWASP 2024+). Includes a hardened reference download controller, image recompression to strip polyglot tails, secret-misconfiguration startup guards, and a SharpFuzz / AFL++ harness for the deep content validator. Honest limitations documented in KNOWN-GAPS.md; every security claim traces to source in SECURITY-ANALYSIS.md.</Description>
+    <PackageTags>aspnetcore;security;file-upload;upload;antivirus;clamav;windows-defender;malware;encryption;aes-gcm;aes256;argon2id;kdf;rfc9106;validation;defense-in-depth;polyglot;pdf;owasp;net10</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageIcon></PackageIcon>
     <PackageProjectUrl>https://github.com/systemslibrarian/secure-file-upload-dotnet</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/systemslibrarian/secure-file-upload-dotnet</RepositoryUrl>
+    <RepositoryUrl>https://github.com/systemslibrarian/secure-file-upload-dotnet.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+    <RepositoryBranch>main</RepositoryBranch>
+    <PackageReleaseNotes>
+v2.0.0 — first stable release of the modernized line.
 
-    <!-- Include source-link and deterministic build for NuGet provenance -->
+BREAKING CHANGES vs. 1.0.0:
+  • Target framework moved from net8.0 to net10.0 only. Consumers on net8.0
+    must either upgrade their runtime or pin to 1.0.0 (the prior stable).
+  • Master Key Encryption Key (KEK) derivation defaults to Argon2id (RFC 9106;
+    m=64 MiB, t=3, p=4) instead of PBKDF2-SHA256. Files written by 1.0.0 still
+    decrypt automatically when FileUpload:KeyDerivation:LegacyKekFallback=true
+    (the default) — no migration step required. New writes use the Argon2id KEK.
+  • New required configuration namespace FileUpload:KeyDerivation:* with sensible
+    defaults. Pre-existing FileUpload:* keys are unchanged.
+
+Highlights:
+  • Memory-hard Argon2id KEK derivation (OWASP 2024+ recommendation). Memory-
+    hardness raises GPU/ASIC brute-force cost-per-guess by orders of magnitude
+    over the prior PBKDF2-SHA256 derivation.
+  • Configurable KDF: Argon2id (default) or Pbkdf2 (FIPS-restricted environments).
+    Argon2id parameters and PBKDF2 iteration count tunable from appsettings.json.
+  • Online-safe upgrade: PBKDF2-derived legacy KEKs (600 000 and 210 000 iterations)
+    are tried during decryption only. No file on disk is bricked by the upgrade.
+  • Packaging: deterministic build, Source Link, snupkg symbols, README + LICENSE
+    + SECURITY-ANALYSIS + KNOWN-GAPS bundled inside the package.
+  • Documentation: full code-traced Implementation &amp; Crypto Posture table,
+    honest residual-risk list, and FIPS-posture statement in README and
+    SECURITY-ANALYSIS.md.
+
+The 8-layer upload pipeline itself is unchanged — the validation, scanning,
+and on-disk envelope format are byte-for-byte identical to preview.2 and
+preview.3, which were the candidates for this release.
+    </PackageReleaseNotes>
+
+    <!-- ── Source Link, deterministic build, symbols ───────────────────── -->
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <Deterministic>true</Deterministic>
 
-    <!-- Produce XML doc so IntelliSense works for package consumers -->
+    <!-- ── XML doc generation ──────────────────────────────────────────── -->
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <!-- Suppress "missing XML doc" warnings for members that aren't yet documented -->
     <NoWarn>1591</NoWarn>
+
+    <!-- ── Treat warnings as errors in CI builds ───────────────────────── -->
+    <TreatWarningsAsErrors Condition="'$(GITHUB_ACTIONS)' == 'true'">false</TreatWarningsAsErrors>
   </PropertyGroup>
 
   <!-- ── Runtime dependencies ─────────────────────────────────────────── -->
   <!--
     Microsoft.AspNetCore.App ships as a shared framework on the target machine —
     referencing it here means it will NOT be bundled inside the package.
-    Consumers must target net8.0 or later with ASP.NET Core present.
+    Consumers must target net10.0 or later with ASP.NET Core present.
   -->
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
@@ -61,6 +97,13 @@
   <ItemGroup>
     <!-- Image identification + recompression (polyglot-tail mitigation) -->
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
+
+    <!--
+      Argon2id key derivation for the master Key Encryption Key (KEK).
+      Memory-hard KDF; RFC 9106; OWASP 2024+ recommendation.
+      Used in FileUploadService for the Argon2id KEK derivation path.
+    -->
+    <PackageReference Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />
 
     <!-- Source Link: maps debug symbols back to the GitHub source tree -->
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
@@ -76,9 +119,12 @@
     <Compile Remove="ReplacementCardInputModel.cs" />
   </ItemGroup>
 
-  <!-- ── Pack: include README at the root of the NuGet package ─────────── -->
+  <!-- ── Pack: include README, LICENSE, and security docs in the package ── -->
   <ItemGroup>
     <None Include="../README.md" Pack="true" PackagePath="\" />
+    <None Include="../LICENSE" Pack="true" PackagePath="\" />
+    <None Include="../SECURITY-ANALYSIS.md" Pack="true" PackagePath="\" />
+    <None Include="../KNOWN-GAPS.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

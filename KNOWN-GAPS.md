@@ -4,6 +4,8 @@
 
 This document exists because intellectual honesty matters more than looking good. Every security codebase has gaps. The goal is to name them clearly so developers using this code know exactly what they're getting and what additional layers they need.
 
+> **As of v1.0.0:** master-KEK derivation has moved from PBKDF2-SHA256 to Argon2id (memory-hard, OWASP / RFC 9106 recommendation for 2026), and the target framework is now `net10.0` only. PBKDF2-derived KEKs remain available *for decryption only* via `FileUpload:KeyDerivation:LegacyKekFallback` so existing files keep working after the upgrade. See `README.md → Implementation & Crypto Posture` for the full posture.
+
 ---
 
 ## Gap 1: Polyglot Files Are Not Fully Eliminated  ✅ FIXED (opt-in)
