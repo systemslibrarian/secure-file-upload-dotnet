@@ -211,19 +211,57 @@ public sealed class StaffFilesController : Controller
     public IActionResult DownloadFirst(FileUploadResult result)
     {
         string token = _fileAccessTokenService.CreateToken(result.UploadedFilePaths[0]);
-      string url = $"/staff/files/download?fileToken={Uri.EscapeDataString(token)}";
+        string url = $"/staff/files/download?fileToken={Uri.EscapeDataString(token)}";
         return Redirect(url);
     }
 }
 ```
 
-The token is opaque, signed, and short-lived by default. Staff-facing URLs never
-need to expose a storage-relative path.
-  If your application has both public and staff-only controllers, scope the
-  `RequireAuthorization("StaffFiles")` call to the staff route set instead of every
-  controller endpoint in the app.
+The token is opaque, signed, and short-lived by default. Staff-facing URLs never need to expose a storage-relative path. If your application has both public and staff-only controllers, scope the `RequireAuthorization("StaffFiles")` call to the staff route set instead of every controller endpoint in the app.
 
 A complete `appsettings.json` reference is in [Configuration](#configuration) below.
+
+---
+
+## Deployment notes
+
+### Data Protection and multi-instance deployments
+
+`AddSecureFileUpload()` calls `services.AddDataProtection()` so that `IFileAccessTokenService` can sign download tokens. With the default registration, **each process generates its own ephemeral key ring** — fine for a single-instance app, but **broken across replicas**: a token issued by node A will not validate on node B, so any load-balanced staff request to `/staff/files/download` has a chance of returning `400 Invalid file reference.`
+
+For any deployment with more than one instance (Kubernetes, multiple App Service workers, an autoscaled VM scale set, dev → staging container, blue-green), configure Data Protection to share a key store and pin an application name **before** `AddSecureFileUpload()`:
+
+```csharp
+// Pick ONE persistence backend that all instances can read.
+
+// Shared filesystem mount (Linux + ReadWriteMany PVC, Windows file share):
+builder.Services.AddDataProtection()
+    .PersistKeysToFileSystem(new DirectoryInfo("/var/keys/secure-file-upload"))
+    .SetApplicationName("SecureFileUpload");
+
+// — OR — Azure Blob + Key Vault (recommended on Azure):
+// builder.Services.AddDataProtection()
+//     .PersistKeysToAzureBlobStorage(blobUri, credential)
+//     .ProtectKeysWithAzureKeyVault(keyIdentifier, credential)
+//     .SetApplicationName("SecureFileUpload");
+
+builder.Services.AddSecureFileUpload();
+```
+
+`SetApplicationName(...)` is the gate that makes keys interchangeable across processes — without it, ASP.NET Core derives a per-content-root application discriminator and tokens still won't cross instances even with a shared key store. The string itself is not a secret; just keep it stable across deployments.
+
+**Symptom of getting this wrong:** intermittent `DOWNLOAD_REJECTED_BAD_TOKEN` warnings in the logs, only on multi-instance environments, only for tokens issued by a different instance than the one handling the download. The single-instance happy-path keeps working, which makes it easy to ship the misconfiguration. Catch it in load-balanced staging.
+
+### Token replay window
+
+A signed download token is reusable for its configured lifetime (`FileDownload:TokenLifetimeMinutes`, default 15 minutes). If a token leaks via a referrer, a screen recording, a log entry, or shared-screen support, an attacker with network access to the staff endpoint can replay it until expiry. Mitigations layered into the library and the recommended deployment:
+
+- `Cache-Control: no-store, no-cache, must-revalidate, private` on every download response — no shared proxy keeps a copy.
+- `Referrer-Policy: no-referrer` so the token doesn't leak to other origins.
+- `[Authorize]` on `SecureFileDownloadController` plus the recommended `RequireAuthorization("StaffFiles")` policy — a leaked token is useless to an unauthenticated attacker.
+- Short default lifetime; lower it further for high-sensitivity workflows.
+
+There is no single-use / nonce-redemption mode in v3. If you need one, track it as a v3.x feature request — the right shape is a redemption store keyed by token hash, gated by `IFileAccessTokenService`.
 
 ---
 

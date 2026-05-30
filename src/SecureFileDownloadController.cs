@@ -4,9 +4,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Net.Http.Headers;
 using SecureFileUpload.Utilities;
-using System;
 using System.IO;
-using System.Text;
 using System.Threading.Tasks;
 
 namespace SecureFileUpload.Services
@@ -201,24 +199,6 @@ namespace SecureFileUpload.Services
             h["Cross-Origin-Resource-Policy"] = "same-origin";
             h["Cross-Origin-Opener-Policy"] = "same-origin";
             h["Cross-Origin-Embedder-Policy"] = "require-corp";
-        }
-
-        private static string SanitizeForLog(string? value)
-        {
-            if (string.IsNullOrEmpty(value)) return "(empty)";
-
-            const int max = 128;
-            var sb = new StringBuilder(Math.Min(value.Length, max));
-            foreach (var c in value)
-            {
-                if (sb.Length >= max) { sb.Append('…'); break; }
-                if (c == '\r' || c == '\n' || c == '\t' || c == '\0' ||
-                    c == '|'  || c == '{'  || c == '}'  || c == '\u001B' ||
-                    char.IsControl(c))
-                { sb.Append('?'); continue; }
-                sb.Append(c);
-            }
-            return sb.ToString();
         }
     }
 }

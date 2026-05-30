@@ -17,10 +17,10 @@
 
     <!-- ── NuGet package metadata ─────────────────────────────────────── -->
     <PackageId>SecureFileUpload.Core</PackageId>
-    <Version>3.0.0</Version>
+    <Version>3.0.1</Version>
     <AssemblyVersion>3.0.0.0</AssemblyVersion>
-    <FileVersion>3.0.0.0</FileVersion>
-    <InformationalVersion>3.0.0</InformationalVersion>
+    <FileVersion>3.0.1.0</FileVersion>
+    <InformationalVersion>3.0.1</InformationalVersion>
     <Authors>Paul Clark (systemslibrarian)</Authors>
     <Company>systemslibrarian</Company>
     <Product>SecureFileUpload.Core</Product>
@@ -36,6 +36,26 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryBranch>main</RepositoryBranch>
     <PackageReleaseNotes>
+v3.0.1 — documentation and code-hygiene patch.
+
+No behavioral or breaking changes. Safe in-place upgrade from 3.0.0.
+
+  • README: new "Deployment notes" section covering the multi-instance Data
+    Protection key-persistence requirement (SetApplicationName +
+    PersistKeysToFileSystem / Azure Blob / KMS-backed key store) so download
+    tokens validate across replicas. Without this, load-balanced staff
+    requests can intermittently fail with DOWNLOAD_REJECTED_BAD_TOKEN.
+  • README: token-replay window explicitly documented along with the
+    mitigations already in the library (no-store cache, Referrer-Policy,
+    [Authorize], short default lifetime).
+  • README: small markdown-rendering fixes in the "Issue a download token"
+    sample so the example renders cleanly on the NuGet gallery page.
+  • Pruned the unused SanitizeForLog helper from SecureFileDownloadController
+    (left over from the pre-3.0.0 path-based input — opaque tokens don't
+    need user-input sanitization).
+  • AssemblyVersion stays at 3.0.0.0 so this is a drop-in upgrade with no
+    binding-redirect change required.
+
 v3.0.0 — hardened download-surface release.
 
 BREAKING CHANGES vs. 2.0.0:
