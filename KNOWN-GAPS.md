@@ -149,7 +149,15 @@ This document exists because intellectual honesty matters more than looking good
 
 ---
 
-## Gap 9: Layer 7 Is Fail-Open on Scanner *Availability* (by design)
+## Gap 9: Layer 7 Is Fail-Open on Scanner *Availability* (by default — now configurable)
+
+> **Updated in 3.0.2:** availability mode is now a runtime configuration option,
+> `VirusScan:FailClosedOnUnavailable` (default `false` — preserves the prior
+> fail-open behavior). Set `true` to flip to fail-closed availability.
+> **Detection mode is always fail-closed**, regardless of this flag.
+> A uniform `VIRUS_SCAN_SKIPPED` security event is emitted in **both** modes so
+> operators can alert on the same metric. See `SECURITY.md` and
+> `README.md → AV failure mode` for the full posture statement.
 
 **What it means:** The virus-scan layer (`IVirusScanService`) has two distinct failure modes, and the pipeline treats them differently:
 

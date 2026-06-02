@@ -5,6 +5,7 @@ using SixLabors.ImageSharp;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Security.Cryptography;
@@ -49,6 +50,30 @@ namespace SecureFileUpload.Services
         /// Prevents zip-bomb style decompression amplification attacks.
         /// </summary>
         public int MaxDecompressedStreamBytes { get; set; } = 16 * 1024 * 1024;
+
+        /// <summary>
+        /// Maximum total wall-clock milliseconds the FlateDecode stream scan may
+        /// run per file. Bounds CPU under adversarially slow or pathological
+        /// inflation even when the count and byte caps would otherwise permit
+        /// continuation. Default 2000 ms.
+        /// </summary>
+        public int MaxPdfStreamScanMilliseconds { get; set; } = 2000;
+
+        /// <summary>
+        /// Maximum allowed per-stream decompression ratio (inflated / compressed).
+        /// A stream expanding beyond this is treated as a decompression bomb and
+        /// the file is rejected as <see cref="ValidationDisposition.RejectedMalicious"/>.
+        /// Default 200x.
+        /// </summary>
+        public int MaxDecompressionRatio { get; set; } = 200;
+
+        /// <summary>
+        /// Maximum nesting depth when an inflated PDF stream itself contains
+        /// recognisable Flate-wrapped sub-content (common with PDF object streams,
+        /// <c>/ObjStm</c>). Depth 0 is the outer file body; depth 1 is the first
+        /// inflated layer. Default 2 — enough for object streams, bounded for safety.
+        /// </summary>
+        public int MaxPdfStreamRecursionDepth { get; set; } = 2;
 
         /// <summary>
         /// Maximum filename length recorded in security logs.
@@ -362,7 +387,7 @@ namespace SecureFileUpload.Services
 
                 return detectedType switch
                 {
-                    DetectedFileType.Pdf  => ValidatePdf(fileBytes, safeFileName),
+                    DetectedFileType.Pdf  => ValidatePdf(fileBytes, safeFileName, cancellationToken),
                     DetectedFileType.Jpeg => ValidateJpeg(fileBytes, safeFileName),
                     DetectedFileType.Png  => ValidatePng(fileBytes, safeFileName),
                     DetectedFileType.Webp => ValidateWebp(fileBytes, safeFileName),
@@ -481,7 +506,7 @@ namespace SecureFileUpload.Services
 
         // ── PDF ───────────────────────────────────────────────────────────────────
 
-        private ContentValidationResult ValidatePdf(byte[] bytes, string fileName)
+        private ContentValidationResult ValidatePdf(byte[] bytes, string fileName, CancellationToken cancellationToken)
         {
             if (bytes.Length < 8)
                 return RejectStructural(fileName, "PDF", "File too small to be a valid PDF.", "PDF-StructuralCheck");
@@ -573,7 +598,7 @@ namespace SecureFileUpload.Services
             // would be invisible to the byte-level pattern scanner above.
             if (_options.InspectCompressedPdfStreams)
             {
-                if (ScanCompressedPdfStreams(bytes, fileName) is { } streamThreat)
+                if (ScanCompressedPdfStreams(bytes, fileName, cancellationToken) is { } streamThreat)
                     return streamThreat;
             }
 
@@ -591,31 +616,88 @@ namespace SecureFileUpload.Services
         // PDF object streams are commonly Flate (zlib) compressed. Threat tokens
         // such as /JavaScript, /JS, /Launch, /OpenAction can be hidden inside
         // these compressed blobs and are invisible to a plain byte/text scan.
+        // PDF object streams (/ObjStm) can also nest — a single compressed stream
+        // may itself contain further `stream`/`endstream` blocks.
         //
         // This helper walks the raw bytes for `stream` … `endstream` pairs (the
         // PDF spec literal markers) and tries to inflate each block. If inflation
         // succeeds, the decompressed bytes are re-scanned for the same dangerous
-        // patterns the outer Layer 6 scan looks for.
+        // patterns the outer Layer 6 scan looks for, and then recursively walked
+        // up to MaxPdfStreamRecursionDepth to find nested compressed streams.
         //
         // Hard caps (configurable):
-        //   • MaxCompressedStreamsToInspect — bounds CPU per file
+        //   • MaxCompressedStreamsToInspect — bounds total CPU per file
         //   • MaxDecompressedStreamBytes    — bounds memory (zip-bomb defence)
+        //   • MaxDecompressionRatio         — per-stream bomb ratio cap
+        //   • MaxPdfStreamScanMilliseconds  — per-file wall-clock cap
+        //   • MaxPdfStreamRecursionDepth    — nested /ObjStm walk depth
         //
         // Failure mode is fail-open per stream (malformed inflate → skip), but
-        // fail-closed for the file overall if any decompressed pattern matches.
-        private ContentValidationResult? ScanCompressedPdfStreams(byte[] bytes, string fileName)
+        // fail-closed for the file overall if any decompressed pattern matches,
+        // any stream exceeds the ratio cap, the time budget is exceeded, or the
+        // CancellationToken fires.
+        private sealed class PdfStreamScanState
         {
+            public int TotalDecompressed;
+            public int StreamsInspected;
+            public Stopwatch Deadline = new();
+            public int TimeoutMs;
+            public int RatioCap;
+            public int MaxStreams;
+            public int MaxDecompressedBytes;
+        }
+
+        private ContentValidationResult? ScanCompressedPdfStreams(
+            byte[] bytes, string fileName, CancellationToken cancellationToken)
+        {
+            var state = new PdfStreamScanState
+            {
+                TimeoutMs            = _options.MaxPdfStreamScanMilliseconds,
+                RatioCap             = _options.MaxDecompressionRatio,
+                MaxStreams           = _options.MaxCompressedStreamsToInspect,
+                MaxDecompressedBytes = _options.MaxDecompressedStreamBytes,
+            };
+            state.Deadline.Start();
+
+            var result = ScanCompressedPdfStreamsCore(bytes, fileName, depth: 0, state, cancellationToken);
+
+            if (state.StreamsInspected > 0)
+                _logger.LogDebug(
+                    "PDF_COMPRESSED_STREAMS_SCANNED | FileName: {FileName} | Streams: {Count} | DecompressedBytes: {Bytes} | ElapsedMs: {Ms}",
+                    fileName, state.StreamsInspected, state.TotalDecompressed, state.Deadline.ElapsedMilliseconds);
+
+            return result;
+        }
+
+        private ContentValidationResult? ScanCompressedPdfStreamsCore(
+            byte[] bytes, string fileName, int depth,
+            PdfStreamScanState state, CancellationToken cancellationToken)
+        {
+            if (depth > _options.MaxPdfStreamRecursionDepth)
+                return null;
+
             ReadOnlySpan<byte> streamMarker = "stream"u8;
             ReadOnlySpan<byte> endMarker = "endstream"u8;
 
-            int totalDecompressed = 0;
-            int streamsInspected = 0;
             int searchFrom = 0;
 
             while (searchFrom < bytes.Length &&
-                   streamsInspected < _options.MaxCompressedStreamsToInspect &&
-                   totalDecompressed < _options.MaxDecompressedStreamBytes)
+                   state.StreamsInspected < state.MaxStreams &&
+                   state.TotalDecompressed < state.MaxDecompressedBytes)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (state.Deadline.ElapsedMilliseconds > state.TimeoutMs)
+                {
+                    _logger.LogWarning(
+                        "SECURITY_EVENT | PDF_STREAM_SCAN_TIMEOUT | FileName: {FileName} | ElapsedMs: {Ms} | Cap: {Cap}",
+                        fileName, state.Deadline.ElapsedMilliseconds, state.TimeoutMs);
+                    return RejectStructural(
+                        fileName, "PDF",
+                        "PDF compressed-stream scan exceeded the configured time budget.",
+                        "PDF-CompressedStreamTimeout");
+                }
+
                 int sIdx = IndexOf(bytes, streamMarker, searchFrom);
                 if (sIdx < 0) break;
 
@@ -637,7 +719,7 @@ namespace SecureFileUpload.Services
                 searchFrom = eIdx + endMarker.Length;
 
                 if (rawLen <= 2) continue;
-                streamsInspected++;
+                state.StreamsInspected++;
 
                 // Try to inflate. PDF FlateDecode is zlib-wrapped (RFC 1950), so
                 // skip the 2-byte zlib header before feeding to DeflateStream
@@ -649,7 +731,7 @@ namespace SecureFileUpload.Services
                 int deflateLen = rawLen - deflateOffset;
                 if (deflateLen <= 0) continue;
 
-                int budget = _options.MaxDecompressedStreamBytes - totalDecompressed;
+                int budget = state.MaxDecompressedBytes - state.TotalDecompressed;
                 if (budget <= 0) break;
 
                 byte[]? inflated;
@@ -672,8 +754,18 @@ namespace SecureFileUpload.Services
                             break;
                         }
                         dst.Write(buf, 0, read);
+
+                        // Re-check the wall-clock and cancellation budgets while
+                        // streaming — a single huge inflate must not block.
+                        cancellationToken.ThrowIfCancellationRequested();
+                        if (state.Deadline.ElapsedMilliseconds > state.TimeoutMs)
+                            break;
                     }
                     inflated = dst.ToArray();
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch
                 {
@@ -682,7 +774,22 @@ namespace SecureFileUpload.Services
                 }
 
                 if (inflated.Length == 0) continue;
-                totalDecompressed += inflated.Length;
+                state.TotalDecompressed += inflated.Length;
+
+                // Decompression-ratio bomb check. A stream expanding more than
+                // RatioCap times its compressed size is treated as malicious —
+                // legitimate FlateDecode rarely exceeds ~10x on document content.
+                int ratio = inflated.Length / Math.Max(deflateLen, 1);
+                if (ratio > state.RatioCap)
+                {
+                    _logger.LogWarning(
+                        "SECURITY_EVENT | PDF_DECOMPRESSION_BOMB | FileName: {FileName} | Ratio: {Ratio} | Cap: {Cap} | Compressed: {Comp} | Inflated: {Inf}",
+                        fileName, ratio, state.RatioCap, deflateLen, inflated.Length);
+                    return RejectMalicious(
+                        fileName, "PDF",
+                        $"Compressed PDF stream expanded {ratio}x (cap {state.RatioCap}x) — decompression-bomb signature.",
+                        "PDF-DecompressionBomb");
+                }
 
                 string decoded = Encoding.Latin1.GetString(inflated);
 
@@ -698,7 +805,7 @@ namespace SecureFileUpload.Services
 
                     return RejectMalicious(
                         fileName, "PDF",
-                        $"Dangerous pattern '{pattern}' found inside FlateDecode-compressed stream.",
+                        $"Dangerous pattern '{pattern}' found inside FlateDecode-compressed stream (depth {depth}).",
                         "PDF-CompressedStreamThreat");
                 }
 
@@ -707,15 +814,19 @@ namespace SecureFileUpload.Services
                     if (decoded.IndexOf(jsToken, StringComparison.OrdinalIgnoreCase) >= 0)
                         return RejectMalicious(
                             fileName, "PDF",
-                            $"JavaScript trigger '{jsToken}' found inside FlateDecode-compressed stream.",
+                            $"JavaScript trigger '{jsToken}' found inside FlateDecode-compressed stream (depth {depth}).",
                             "PDF-CompressedStreamThreat");
                 }
-            }
 
-            if (streamsInspected > 0)
-                _logger.LogDebug(
-                    "PDF_COMPRESSED_STREAMS_SCANNED | FileName: {FileName} | Streams: {Count} | DecompressedBytes: {Bytes}",
-                    fileName, streamsInspected, totalDecompressed);
+                // Recurse into the inflated bytes for nested object streams,
+                // bounded by MaxPdfStreamRecursionDepth.
+                if (depth < _options.MaxPdfStreamRecursionDepth)
+                {
+                    var inner = ScanCompressedPdfStreamsCore(
+                        inflated, fileName, depth + 1, state, cancellationToken);
+                    if (inner != null) return inner;
+                }
+            }
 
             return null;
         }

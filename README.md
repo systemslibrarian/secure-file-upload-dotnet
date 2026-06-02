@@ -1,6 +1,6 @@
 # SecureFileUpload.Core
 
-**Defense-in-depth file upload pipeline for ASP.NET Core 8 / 9 / 10 — AES-256-GCM envelope encryption, Argon2id key derivation, deep content validation, and pluggable virus scanning.**
+**The defense-in-depth file-upload pipeline from a real production library system, packaged for ASP.NET Core 8 / 9 / 10.**
 
 [![NuGet](https://img.shields.io/nuget/v/SecureFileUpload.Core.svg?style=flat-square)](https://www.nuget.org/packages/SecureFileUpload.Core)
 [![NuGet downloads](https://img.shields.io/nuget/dt/SecureFileUpload.Core.svg?style=flat-square)](https://www.nuget.org/packages/SecureFileUpload.Core)
@@ -8,12 +8,25 @@
 [![Targets: net8.0 / net9.0 / net10.0](https://img.shields.io/badge/targets-net8.0%20%7C%20net9.0%20%7C%20net10.0-512BD4.svg?style=flat-square)](https://dotnet.microsoft.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 
-`SecureFileUpload.Core` is a battle-tested file-upload pipeline lifted from a production ASP.NET Core document-intake workflow, de-branded, hardened, and shipped as a single NuGet package. Every layer is implemented in code you can read; every limitation is named in [`KNOWN-GAPS.md`](KNOWN-GAPS.md); every security claim traces to a specific line in `src/` per the audit in [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md).
+`SecureFileUpload.Core` is lifted from the document-intake workflow of a live public-library patron-registration system, de-branded, hardened, and shipped as a single NuGet package. Eight serial validation layers, encrypted-at-rest storage outside `wwwroot`, and a hardened reference download surface — all behind one `AddSecureFileUpload()` call. Every layer is implemented in code you can read; every limitation is named in [`KNOWN-GAPS.md`](KNOWN-GAPS.md); every security claim traces to a specific line in `src/` per the audit in [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md).
+
+> This package is **independent of the PostQuantum.\* family.** It is a classical (non-PQC) security library: AES-256-GCM at rest, Argon2id for the master KEK, no post-quantum asymmetric layer. See [`SECURITY.md → Crypto classification`](SECURITY.md) for the explicit posture statement.
 
 > *"So whether you eat or drink or whatever you do, do it all for the glory of God."*
 > — 1 Corinthians 10:31
 
 ---
+
+## What's New in 3.0.3
+
+`3.0.3` is a **defense-in-depth hardening patch**. No public API break. `AssemblyVersion` stays at `3.0.0.0` — drop-in upgrade from any `3.0.x`.
+
+- **Filename validation is NFKC-normalized.** A fullwidth `．．` (U+FF0E ×2) can no longer pretend not to be `..`; fullwidth reserved names (`ＣＯＮ.pdf`) and fullwidth-disguised double-extensions (`evil．exe.pdf`) are caught alongside their literal forms. Trailing dot and trailing space are rejected before Windows path resolution strips them. Hard 255-character length cap. **Legitimate non-ASCII filenames** (accented Latin, CJK, Cyrillic, Greek, etc.) **pass through unchanged** — NFKC is identity on those.
+- **PDF deep validation gains hard caps against decompression bombs and polyglots.** Per-stream **decompression-ratio cap** (default `200×`), per-file **wall-clock timeout** (default `2 000 ms`), bounded **nested-stream recursion depth** (default `2` for `/ObjStm`), and full `CancellationToken` propagation through the FlateDecode walker.
+- **AV availability mode is now configurable.** `VirusScan:FailClosedOnUnavailable` (default `false` = prior fail-open behavior). Set `true` to reject the upload when the scanner cannot give a verdict. Detection mode is **always** fail-closed regardless of this flag. A uniform `VIRUS_SCAN_SKIPPED` security event fires in both modes — operators alert on a single signal.
+- **Crypto classification is now explicit.** At-rest encryption is **classical AES-256-GCM** (quantum-tolerant by key size for confidentiality, but no PQ asymmetric layer). New [`SECURITY.md`](SECURITY.md) states the posture and the deliberate separation from the `PostQuantum.*` family.
+- **`HardeningRegressionTests` adds 25 cases** covering filename evasions and legitimate-Unicode acceptance, decompression-bomb rejection inside the time budget, nested FlateDecode recursion, cancellation propagation, fail-closed AV mode, concurrent encrypted uploads, and `PathHelper.IsPathUnderBase` encoded-separator resistance. Fuzz harness gains a triage assertion that treats any `Allowed` verdict on a curated seed under [`tests/Fuzz/seeds/`](tests/Fuzz/seeds/) as a finding.
+- **No change** to the 8-layer pipeline order, the v2 envelope encryption format (`ENCGCM\0\x02`), the Argon2id KEK derivation, the PBKDF2 legacy decrypt fallback, or the plaintext / DEK / KDF-input zeroing discipline. Smoke harness still 18/18 green.
 
 ## What's New in 3.0.2
 
@@ -42,21 +55,21 @@ The crypto posture, parameters, and honest residual risks are documented in [Imp
 
 ---
 
-## Why this exists
+## What this is
 
-File upload is one of the most consistently mishandled surfaces in web development. Most tutorials show you how to *receive* a file. Very few defend against:
+Most ASP.NET Core upload examples show you how to *receive* a file. This package is the production version of an intake workflow that has accepted thousands of patron documents — driver's licenses, utility bills, library replacement-card paperwork — under real-world adversarial conditions. The eight layers exist because each one caught something in production:
 
 - Polyglot files (a valid JPEG that is also a working PHP shell)
-- Double-extension attacks (`photo.pdf.exe`)
+- Double-extension attacks (`photo.pdf.exe`, including fullwidth-Unicode disguises after NFKC normalization)
 - MIME spoofing and magic-byte forgery
-- Path traversal via filename manipulation
-- PDF JavaScript injection (including inside FlateDecode-compressed object streams)
+- Path traversal via filename manipulation, NTFS alternate data streams, and Windows reserved device names
+- PDF JavaScript injection (including inside FlateDecode-compressed object streams, with hard caps on stream count, decompressed bytes, decompression ratio, and wall-clock time)
 - ZIP-bomb / pixel-flood attacks via image decoding
 - Log poisoning via crafted filenames
 - Disk exhaustion via batched uploads
 - Direct web-serving of attacker-controlled bytes
 
-This package addresses every item on that list in code, then names the gaps it does *not* close. The red-team review in [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) traces each claim to its source line.
+This package addresses every item on that list in code, then names the gaps it does *not* close. The red-team review in [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) traces each claim to its source line. You do not need to care about cryptography to adopt the upload pipeline — crypto details are in §[Implementation & Crypto Posture](#implementation--crypto-posture) below; the validation pipeline runs identically whether or not you read that section.
 
 ---
 
@@ -116,6 +129,30 @@ Every uploaded file passes through eight serial layers. **Failure at any content
        └──────────────────────────────────────────────────┘
 ```
 
+### What each layer actually does
+
+For an ASP.NET developer adopting this pipeline without any cryptography interest, here is the one-paragraph "what does this defend against" view of each layer. Crypto details remain in §[Implementation & Crypto Posture](#implementation--crypto-posture) below — the pipeline runs identically whether or not you read that section.
+
+| Layer | Defends against | One-line summary |
+|---|---|---|
+| 1 — Size + batch | Disk-exhaustion DoS, oversized scans | Per-file and per-batch byte caps enforced before any buffering. |
+| 2 — Extension allowlist | Wrong-format uploads, executables-by-name | Only `.jpg .jpeg .png .webp .pdf` proceed. Everything else stops here. |
+| 3 — MIME ↔ extension cross-check | MIME-spoofing toolchains | Browser-reported `Content-Type` must match the extension. Mismatch rejects. |
+| 4 — Magic-byte signature | Renamed `.exe → .pdf` and disguised payloads | Header bytes must match the format; known-dangerous headers (PE/ELF/Mach-O/OLE/PHP/script) are named in the log message so an operator can spot the disguise. |
+| 5 — Filename inspection | Path traversal, NTFS alternate data streams, Unicode bidi/zero-width tricks, double-extension (`photo.pdf.exe`), Windows reserved device names (`CON`, `PRN`, `NUL`, `COM1-9`, `LPT1-9`), trailing dots/spaces, control characters, fullwidth-Unicode disguises | NFKC-normalized scan so a fullwidth `．．` cannot pretend not to be `..`; 255-character length cap; trailing `.` or space is rejected before Windows path resolution strips it. |
+| 6 — Deep content validation | Polyglot files, PDF JavaScript / `/Launch` / `/EmbeddedFile` / JBIG2, embedded executables, ZIP-bomb image dimensions, PHP shells in image metadata | Format-specific structural walkers (JPEG segments, PNG chunks, WebP RIFF tree, GIF blocks, BMP DIB) plus a FlateDecode-compressed PDF stream scanner with hard caps on stream count, total decompressed bytes, **per-stream decompression ratio**, **per-file wall-clock time**, and **recursion depth** for nested compressed object streams. Fail-closed on any unknown type or exception. |
+| 7 — Virus scan | Known-bad signatures the prior layers can't fingerprint | Windows Defender (`MpCmdRun.exe`) on Windows, ClamAV (`clamd` over TCP) elsewhere. **Detection is always fail-closed; availability is a configured operator choice — see §AV failure mode below.** |
+| 8 — Encrypted storage | At-rest disclosure if the storage volume leaks or is exfiltrated | AES-256-GCM envelope (v2): per-file random 256-bit DEK wrapped under an Argon2id-derived master KEK. Image recompression strips polyglot tails before encryption. Randomized filename outside `wwwroot`. Final `PathHelper.IsPathUnderBase` re-check at write time. Plaintext, DEK, and KDF-input buffers zeroed in `finally` blocks. |
+
+### AV failure mode: fail-open vs. fail-closed (explicit operator choice)
+
+When the virus scanner is **unreachable** (clamd down, `MpCmdRun.exe` missing, timeout, parser error, exception), the pipeline must pick one of two behaviors. As of `3.0.2` this is an explicit configuration option:
+
+- **Fail-open on availability** — `VirusScan:FailClosedOnUnavailable=false` *(default; matches prior behavior)*. The file is accepted and recorded as `NotScanned`, counted in `FileUploadResult.ScanNotScannedCount`, and a single `VIRUS_SCAN_SKIPPED` security event is emitted with `Reason=ScannerUnavailable` so operators can alert on a non-zero count per window. This is the trade-off the original library deployment made: a Defender hiccup must not block patrons from registering for a library card.
+- **Fail-closed on availability** — `VirusScan:FailClosedOnUnavailable=true`. Scanner unavailability **rejects** the upload with a clear `scanner unavailable` workflow error. The same `VIRUS_SCAN_SKIPPED` metric is still emitted so operations can alert identically in either mode.
+
+**Detection** (an `Infected` verdict from a reachable scanner) is **always fail-closed**, regardless of this setting. The knob only controls what happens when the scanner cannot give a verdict at all. Pick the mode that matches your environment's risk tolerance; do not pick by default.
+
 ---
 
 ## Install
@@ -134,7 +171,7 @@ Pick the TFM that matches your host:
 | .NET 9 (STS, in support)  | `net9.0` build      | Same source. |
 | .NET 10 (LTS, current)    | `net10.0` build     | Same source. |
 
-> If you're upgrading from `3.0.0` / `3.0.1`, this is a drop-in change — `AssemblyVersion` is unchanged at `3.0.0.0` and the on-disk envelope formats (`ENCGCM\0\x01` / `ENCGCM\0\x02`) are byte-for-byte compatible. No re-wrap, no migration.
+> If you're upgrading from any prior `3.0.x` (`3.0.0` / `3.0.1` / `3.0.2`), this is a drop-in change — `AssemblyVersion` is unchanged at `3.0.0.0` and the on-disk envelope formats (`ENCGCM\0\x01` / `ENCGCM\0\x02`) are byte-for-byte compatible. No re-wrap, no migration. The new `VirusScan:FailClosedOnUnavailable` knob defaults to `false`, which preserves the prior fail-open behavior — opt in to fail-closed availability only if your environment requires it.
 
 ---
 
@@ -286,6 +323,7 @@ This section names primitives, parameters, and residual risks. It is the single 
 
 | Aspect | Implementation | Notes |
 |---|---|---|
+| Crypto classification | **Classical, not post-quantum.** AES-256-GCM provides quantum-resistant *confidentiality* by key size (Grover's algorithm halves the effective key size to 128 bits, which remains comfortable). There is **no PQ asymmetric layer** — no ML-KEM, no ML-DSA, no asymmetric primitives at all. | This package is intentionally separate from the `PostQuantum.*` family. No PQC migration path is planned for v3.x. See [`SECURITY.md`](SECURITY.md) for the explicit posture. |
 | Symmetric encryption | **AES-256-GCM** via `System.Security.Cryptography.AesGcm` | 96-bit nonce, 128-bit auth tag — NIST SP 800-38D / RFC 5288. |
 | Encryption scheme | **Envelope (v2)** — per-file random 256-bit DEK wrapped under a master KEK | KEK rotation rewraps DEKs without re-encrypting file payloads. |
 | KEK derivation (writes) | **Argon2id** via `Konscious.Security.Cryptography.Argon2` 1.3.x | RFC 9106; OWASP 2024+ recommendation. Memory-hard. |

@@ -111,6 +111,7 @@ namespace SecureFileUpload.Services
         private readonly IReadOnlyList<byte[]> _legacyEncryptionKeys; // Decrypt-only fallback KEKs (legacy PBKDF2 iteration counts, or prior algorithm)
         private readonly string _kdfAlgorithmLabel;    // "Argon2id" or "PBKDF2-SHA256" — for logging only
         private readonly bool _virusScanEnabled;       // mirrors VirusScan:Enabled in appsettings
+        private readonly bool _failClosedOnUnavailable; // VirusScan:FailClosedOnUnavailable, default false
         private readonly bool _recompressImages;       // Gap 1 mitigation — strips polyglot tails on write
         private readonly int _jpegRecompressQuality;   // 1–100, default 95
 
@@ -326,6 +327,12 @@ namespace SecureFileUpload.Services
             _lowDiskWarningBytes = _configuration.GetValue<long>("FileUpload:LowDiskWarningBytes", 2L * 1024 * 1024 * 1024);
 
             _virusScanEnabled = _configuration.GetValue<bool>("VirusScan:Enabled", false);
+            // Availability-mode knob (Gap 9). Default false preserves prior
+            // behavior — scanner unavailability → NotScanned, file accepted.
+            // True flips to fail-closed: scanner unavailability → rejection.
+            // Detection mode is always fail-closed regardless of this flag.
+            _failClosedOnUnavailable = _configuration.GetValue<bool>(
+                "VirusScan:FailClosedOnUnavailable", false);
 
             // Gap 1 mitigation: re-encode JPEG/PNG/WebP after validation but before write.
             // Decoding then re-encoding through ImageSharp strips any data appended after
@@ -458,14 +465,15 @@ namespace SecureFileUpload.Services
             _logger.LogInformation(
                 "FileUploadService initialized | StorageRoot: {Path} | MaxSize: {Size}MB | MaxCount: {Count} | MaxTotal: {TotalMB}MB | " +
                 "MinStorageFree: {MinStorageMB}MB | MinTempFree: {MinTempMB}MB | LowDiskWarn: {WarnMB}MB | " +
-                "Encryption: {Enc} | KDF: {Kdf} | Recompress: {RC} | DeepValidation: enabled | VirusScan: {VS} ({Scanner})",
+                "Encryption: {Enc} | KDF: {Kdf} | Recompress: {RC} | DeepValidation: enabled | VirusScan: {VS} ({Scanner}) | AvailabilityMode: {Mode}",
                 _storageRoot, _maxFileSizeBytes / 1024 / 1024, _maxFileCount, _maxTotalUploadBytes / 1024 / 1024,
                 _minStorageFreeBytes / 1024 / 1024, _minTempFreeBytes / 1024 / 1024, _lowDiskWarningBytes / 1024 / 1024,
                 _encryptionEnabled ? "AES-256-GCM (envelope/v2)" : "disabled",
                 _kdfAlgorithmLabel,
                 _recompressImages ? $"enabled (JPEG q={_jpegRecompressQuality})" : "disabled",
                 _virusScanEnabled ? "enabled" : "disabled",
-                _virusScanService.ScannerName);
+                _virusScanService.ScannerName,
+                _failClosedOnUnavailable ? "fail-closed" : "fail-open");
         }
 
         /// <summary>
@@ -646,7 +654,23 @@ namespace SecureFileUpload.Services
                             continue; // skip writing this file
 
                         case VirusScanOutcome.NotScanned:
+                            // Uniform skip metric — emitted in BOTH fail-open and
+                            // fail-closed modes so operators can alert on a single
+                            // signal regardless of the configured policy.
+                            _logger.LogWarning(
+                                "SECURITY_EVENT | VIRUS_SCAN_SKIPPED | Reason: ScannerUnavailableOrDisabled | FailClosed: {FailClosed} | Scanner: {Scanner} | FileName: {FileName} | Form: {FormType}",
+                                _failClosedOnUnavailable, _virusScanService.ScannerName,
+                                SanitizeForLog(file.FileName), formType);
                             scanNotScanned++;
+                            if (_failClosedOnUnavailable && _virusScanEnabled)
+                            {
+                                // Fail-closed on availability — refuse the file
+                                // even though it passed Layers 1–6. The skip metric
+                                // above is the operator-facing signal.
+                                result.Errors.Add(
+                                    $"File '{SanitizeForLog(file.FileName)}': scanner unavailable; upload rejected (fail-closed policy).");
+                                continue;
+                            }
                             break;
                     }
 
@@ -1311,28 +1335,63 @@ namespace SecureFileUpload.Services
         /// Check for suspicious patterns in file names.
         /// Detects: path traversal, null bytes, Unicode tricks, control characters,
         /// double extensions (e.g. photo.php.jpg), dangerous extensions in the stem,
-        /// Windows ADS (alternate data streams), and Windows reserved device names.
+        /// Windows ADS (alternate data streams), Windows reserved device names,
+        /// trailing dot/space (Windows path-strip evasion), and excessive length.
+        ///
+        /// Filenames are NFKC-normalized BEFORE all checks so that fullwidth
+        /// disguises (U+FF0E '．' for '.', fullwidth letters for reserved names,
+        /// fullwidth dangerous extensions) cannot bypass the literal checks.
+        /// Legitimate non-ASCII filenames (accented Latin, CJK, Cyrillic, etc.)
+        /// are preserved by NFKC and pass through unmodified.
         /// </summary>
         private static (bool IsSuspicious, string? Reason) ContainsSuspiciousPatterns(string fileName)
         {
             if (string.IsNullOrWhiteSpace(fileName))
                 return (true, "Empty filename");
 
-            if (fileName.Contains(".."))
-                return (true, "Path traversal sequence (..)");
+            // Hard upper bound — far above any legitimate document filename.
+            if (fileName.Length > 255)
+                return (true, "Filename exceeds 255-character limit");
 
-            if (fileName.Contains('/') || fileName.Contains('\\'))
+            // NFKC normalization collapses fullwidth and compatibility forms so
+            // that U+FF0E '．' cannot disguise a real '.' sequence, fullwidth
+            // letters cannot disguise reserved device names, and fullwidth
+            // dangerous extensions are caught by the literal checks below.
+            // NFKC is identity on ordinary Latin/CJK/Cyrillic etc. — accented
+            // names like "café.pdf" or CJK names like "李明.pdf" pass through
+            // unchanged, so legitimate non-ASCII filenames remain valid.
+            string normalized;
+            try
+            {
+                normalized = fileName.Normalize(NormalizationForm.FormKC);
+            }
+            catch (ArgumentException)
+            {
+                // Malformed Unicode that cannot be normalized — refuse it.
+                return (true, "Filename contains malformed Unicode");
+            }
+
+            if (normalized.Contains(".."))
+                return (true, "Path traversal sequence (..) after NFKC normalization");
+
+            // Windows strips trailing dots and spaces during path resolution, so
+            // "evil.exe." resolves to "evil.exe". Reject before that strip happens.
+            if (normalized.Length > 0 &&
+                (normalized[normalized.Length - 1] == '.' || normalized[normalized.Length - 1] == ' '))
+                return (true, "Trailing dot or space (Windows path-strip evasion)");
+
+            if (normalized.Contains('/') || normalized.Contains('\\'))
                 return (true, "Path separator in filename");
 
-            if (fileName.Contains('\0'))
+            if (normalized.Contains('\0'))
                 return (true, "Null byte in filename");
 
             // Windows NTFS alternate data streams — "file.jpg:payload.exe"
-            if (fileName.Contains(':'))
+            if (normalized.Contains(':'))
                 return (true, "Colon in filename (possible NTFS ADS attack)");
 
             // Detect Unicode directional override characters (RTL/LTR tricks)
-            foreach (var c in fileName)
+            foreach (var c in normalized)
             {
                 if (c == '\u202E' || c == '\u200F' || c == '\u200E' ||   // RTL/LTR overrides
                     c == '\u202A' || c == '\u202B' || c == '\u202C' ||   // Embedding controls
@@ -1346,14 +1405,15 @@ namespace SecureFileUpload.Services
                 }
             }
 
-            // Windows reserved device names
-            var stem = Path.GetFileNameWithoutExtension(fileName)?.ToUpperInvariant() ?? "";
+            // Windows reserved device names (post-normalization so that
+            // fullwidth ＣＯＮ.pdf is caught here too).
+            var stem = Path.GetFileNameWithoutExtension(normalized)?.ToUpperInvariant() ?? "";
             if (WindowsReservedNames.Contains(stem))
                 return (true, $"Windows reserved device name: {stem}");
 
             // Double-extension detection: check if ANY dangerous extension appears
             // in the filename stem (the part before the final extension).
-            var nameWithoutFinalExt = Path.GetFileNameWithoutExtension(fileName);
+            var nameWithoutFinalExt = Path.GetFileNameWithoutExtension(normalized);
             if (!string.IsNullOrEmpty(nameWithoutFinalExt))
             {
                 foreach (var dangerousExt in DangerousExtensions)

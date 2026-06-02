@@ -46,6 +46,20 @@ public static class Program
                 Console.WriteLine(
                     $"Result: IsValid={result.IsValid} Disposition={result.Disposition} " +
                     $"ValidationType={result.ValidationType} Threat={result.ThreatDescription}");
+
+                // When the seed lives under tests/Fuzz/seeds/, treat an Allowed
+                // disposition as a fuzz finding (exit non-zero). Seeds in that
+                // directory are curated bad-input by construction: any "Allowed"
+                // verdict is a bypass that needs investigation.
+                string normalised = args[0].Replace('\\', '/');
+                if (normalised.Contains("/seeds/", StringComparison.OrdinalIgnoreCase) &&
+                    result.Disposition == ValidationDisposition.Allowed)
+                {
+                    Console.Error.WriteLine(
+                        $"FUZZ FINDING — curated bad-input seed was Allowed: {args[0]}");
+                    return 1;
+                }
+
                 return 0;
             }
             catch (Exception ex)

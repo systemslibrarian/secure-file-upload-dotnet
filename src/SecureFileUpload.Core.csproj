@@ -19,10 +19,10 @@
 
     <!-- ── NuGet package metadata ─────────────────────────────────────── -->
     <PackageId>SecureFileUpload.Core</PackageId>
-    <Version>3.0.2</Version>
+    <Version>3.0.3</Version>
     <AssemblyVersion>3.0.0.0</AssemblyVersion>
-    <FileVersion>3.0.2.0</FileVersion>
-    <InformationalVersion>3.0.2</InformationalVersion>
+    <FileVersion>3.0.3.0</FileVersion>
+    <InformationalVersion>3.0.3</InformationalVersion>
     <Authors>Paul Clark (systemslibrarian)</Authors>
     <Company>systemslibrarian</Company>
     <Product>SecureFileUpload.Core</Product>
@@ -38,6 +38,45 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryBranch>main</RepositoryBranch>
     <PackageReleaseNotes>
+v3.0.3 — defense-in-depth hardening (backward-compatible patch).
+
+No public API break. AssemblyVersion stays at 3.0.0.0 so this is a drop-in
+upgrade from any 3.0.x line.
+
+  • Filename validation now NFKC-normalizes before all checks, defeating
+    fullwidth-Unicode disguises (U+FF0E '．' → '.'), fullwidth reserved
+    device names (ＣＯＮ.pdf), and fullwidth-disguised double-extensions.
+    Trailing dots and spaces are rejected (Windows path-strip evasion),
+    and a 255-character length cap is enforced. Legitimate non-ASCII
+    filenames (accented Latin, CJK, Cyrillic, Greek, etc.) pass through
+    unchanged — NFKC is identity on those.
+  • PDF deep validation gains hard caps against decompression-bomb and
+    polyglot adversarial inputs: per-stream decompression-ratio cap
+    (default 200x), per-file wall-clock timeout (default 2000 ms),
+    bounded nested-stream recursion depth (default 2 for /ObjStm), and
+    full CancellationToken propagation through the FlateDecode walker.
+  • Virus-scan availability mode is now an explicit configuration option:
+    VirusScan:FailClosedOnUnavailable (default false = prior fail-open
+    behavior; set true to reject the upload when the scanner cannot give
+    a verdict). Detection mode is always fail-closed regardless of this
+    flag. A uniform VIRUS_SCAN_SKIPPED security event is emitted in both
+    modes so operators can alert on a single signal.
+  • Crypto classification is now explicit: at-rest encryption is classical
+    AES-256-GCM (quantum-tolerant by key size for confidentiality, but no
+    PQ asymmetric layer). New SECURITY.md states the posture and the
+    deliberate separation from the PostQuantum.* family.
+  • New HardeningRegressionTests cover the filename evasion matrix (with
+    positive coverage for legitimate accented/CJK/Cyrillic/Greek names),
+    decompression-bomb rejection within the time budget, nested
+    FlateDecode recursion, cancellation propagation, fail-closed AV mode,
+    concurrent encrypted uploads, and PathHelper.IsPathUnderBase
+    resistance to encoded separators. Fuzz harness gains a triage
+    assertion that treats any "Allowed" verdict on a curated seed under
+    tests/Fuzz/seeds/ as a finding.
+  • No change to the 8-layer pipeline order, the v2 envelope encryption
+    format, the Argon2id KEK derivation, the PBKDF2 legacy decrypt
+    fallback, or the plaintext/DEK/KDF-input zeroing discipline.
+
 v3.0.2 — multi-targeting restored (net8.0; net9.0; net10.0).
 
 No behavioral, on-disk-format, or crypto-posture changes from 3.0.1. The
@@ -160,6 +199,7 @@ decryption compatibility are unchanged from 2.0.0.
   <ItemGroup>
     <None Include="../README.md" Pack="true" PackagePath="\" />
     <None Include="../LICENSE" Pack="true" PackagePath="\" />
+    <None Include="../SECURITY.md" Pack="true" PackagePath="\" />
     <None Include="../SECURITY-ANALYSIS.md" Pack="true" PackagePath="\" />
     <None Include="../KNOWN-GAPS.md" Pack="true" PackagePath="\" />
   </ItemGroup>
