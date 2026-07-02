@@ -208,7 +208,7 @@ decryption compatibility are unchanged from 2.0.0.
 
   <ItemGroup>
     <!-- Image identification + recompression (polyglot-tail mitigation) -->
-    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
+    <PackageReference Include="SixLabors.ImageSharp" Version="4.0.0" />
 
     <!--
       Argon2id key derivation for the master Key Encryption Key (KEK).
