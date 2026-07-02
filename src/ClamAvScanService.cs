@@ -70,8 +70,19 @@ namespace SecureFileUpload.Services
                 "VirusScan:ClamAv:TimeoutSeconds", DefaultTimeoutSeconds);
             _timeoutSeconds = Math.Clamp(configuredTimeout, 1, MaxTimeoutSeconds);
 
-            _maxStreamBytes = configuration.GetValue<int>(
+            var configuredMaxStream = configuration.GetValue<int>(
                 "VirusScan:ClamAv:MaxStreamBytes", DefaultMaxStreamBytes);
+            if (configuredMaxStream <= 0)
+            {
+                // A non-positive limit would fail every scan (budget exhausted before
+                // the first chunk), silently disabling scanning under the fail-open
+                // availability default. Fall back to the documented default instead.
+                _logger.LogWarning(
+                    "ClamAV MaxStreamBytes misconfigured ({Configured}); using default {Default} bytes.",
+                    configuredMaxStream, DefaultMaxStreamBytes);
+                configuredMaxStream = DefaultMaxStreamBytes;
+            }
+            _maxStreamBytes = configuredMaxStream;
 
             _logger.LogInformation(
                 "ClamAV scanner configured. Host: {Host}:{Port}, Timeout: {Timeout}s, MaxStream: {MaxStream} bytes",

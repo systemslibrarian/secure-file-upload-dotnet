@@ -3,7 +3,68 @@
 All notable changes to `SecureFileUpload.Core` are recorded here. The package
 follows semantic versioning. `AssemblyVersion` is held at `3.0.0.0` across the
 entire `3.0.x` line so patch releases are drop-in upgrades with no
-binding-redirect churn.
+binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`.
+
+## 3.1.0 — 2026-07-02 — Fail-closed sanitization, user-bound download tokens
+
+No public API break — `FileAccessTokenService` gains one optional constructor
+parameter (`IHttpContextAccessor?`), resolved by DI; existing call sites
+compile unchanged. One deliberate behavioral change, revertible by config
+(see *Changed*).
+
+### Added
+
+- **`FileUpload:RejectOnRecompressFailure`** (default `true`). Governs the
+  failure mode of the Gap 1 sanitizing re-encode — see *Changed*.
+- **`FileDownload:BindTokensToUser`** (default `false`). When `true`, the
+  authenticated user's identity (`ClaimTypes.NameIdentifier`, falling back to
+  `Identity.Name`) is folded into the Data Protection purpose chain at token
+  creation. A token replayed by a *different* authenticated account fails
+  cryptographic verification — not merely a policy check. Issuing a token on
+  an unauthenticated request throws; startup fails fast if the flag is on but
+  no `IHttpContextAccessor` is available. `AddSecureFileUpload()` now calls
+  `AddHttpContextAccessor()` (a no-op if the host already registered it).
+- **`.github/dependabot.yml`** — weekly update PRs for `nuget` (ImageSharp is
+  fed attacker-controlled bytes by design; its advisories should open PRs
+  automatically) and `github-actions` ecosystems.
+- **`HardeningV310Tests`** — fail-closed and fallback recompression paths,
+  valid-image round-trip (no over-rejection), HTML-neutralized error output,
+  and the token-binding matrix (same-user resolve, cross-user replay
+  rejection, anonymous issuance refusal, unbound default round-trip).
+
+### Changed
+
+- **Image recompression now fails closed** (Gap 1). Previously, if the
+  sanitizing re-encode failed, the pipeline logged a warning and stored the
+  *original* validated bytes — but a file whose header parses
+  (`Image.Identify`, structural walkers) while its pixel data fails a full
+  decode is exactly the shape of a crafted polyglot, so the fallback silently
+  defeated the mitigation and kept any appended tail on disk. The upload is
+  now rejected with a clear per-file message
+  (`SECURITY_EVENT | FILE_SAVE_BLOCKED_SANITIZATION`). Set
+  `FileUpload:RejectOnRecompressFailure=false` to restore the old behavior.
+- **`SanitizeForLog` neutralizes HTML-active characters** (`<`, `>`, `"`,
+  `'` → `?`). Its output is embedded in user-facing `FileUploadResult.Errors`
+  strings; a consumer rendering those errors without encoding could
+  previously be handed markup from a filename like `<svg onload=…>.jpg`.
+- **Windows Defender scan timeout** now clamps with a lower bound of 1 s
+  (`Math.Clamp(configured, 1, 120)`, matching ClamAV). A configured `0`
+  previously made every scan time out instantly — silently disabling
+  scanning under the fail-open availability default.
+- **ClamAV `MaxStreamBytes` ≤ 0** now falls back to the 25 MiB default with
+  a warning instead of exhausting the budget before the first chunk and
+  failing every scan.
+- **GitHub Actions pinned to commit SHAs** in both workflows (tag-pinning is
+  mutable; Dependabot keeps the pinned SHAs current).
+- **`.gitignore`** — local pack-inspection scratch folders (`_extract/`,
+  `_verify/`, `_pack_inspect/`) ignored so unpacked binaries can't be
+  committed accidentally.
+
+### Unchanged
+
+- The 8-layer pipeline order, on-disk envelope formats (`ENCGCM\0\x01` /
+  `\x02`), Argon2id KEK derivation, PBKDF2 legacy decrypt fallback, and the
+  plaintext/DEK zeroing discipline.
 
 ## 3.0.3 — 2026-06-01 — Defense-in-depth hardening
 

@@ -44,6 +44,11 @@ namespace SecureFileUpload.Services
         {
             services.AddDataProtection();
 
+            // Required by FileAccessTokenService when FileDownload:BindTokensToUser=true
+            // (download tokens cryptographically bound to the issuing user).
+            // No-op if the host already registered it.
+            services.AddHttpContextAccessor();
+
             // Validator options — honour appsettings by default; allow inline override.
             if (configureValidator != null)
                 services.Configure(configureValidator);

@@ -24,6 +24,12 @@ nuget.api.key
 uploads/
 scan-temp/
 
+# Local pack-inspection scratch (unpacked nupkg contents, compiled DLLs) —
+# binaries must never land in source control
+_extract/
+_verify/
+_pack_inspect/
+
 # IDE
 .vscode/
 .idea/

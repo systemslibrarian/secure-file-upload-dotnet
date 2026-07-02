@@ -312,8 +312,9 @@ A signed download token is reusable for its configured lifetime (`FileDownload:T
 - `Referrer-Policy: no-referrer` so the token doesn't leak to other origins.
 - `[Authorize]` on `SecureFileDownloadController` plus the recommended `RequireAuthorization("StaffFiles")` policy — a leaked token is useless to an unauthenticated attacker.
 - Short default lifetime; lower it further for high-sensitivity workflows.
+- **User binding (3.1.0, opt-in):** set `FileDownload:BindTokensToUser=true` and the authenticated user's identity (`ClaimTypes.NameIdentifier`, falling back to `Identity.Name`) is folded into the Data Protection purpose chain at token creation. The token then only unprotects for a request carrying the *same* identity — a token replayed by any other account fails cryptographic verification, not just a policy check. Issuing a token on an unauthenticated request throws. Requires `IHttpContextAccessor`, which `AddSecureFileUpload()` registers for you. Tokens issued before enabling the flag stop validating (they are unbound) — a non-issue in practice given the 15-minute default lifetime.
 
-There is no single-use / nonce-redemption mode in v3. If you need one, track it as a v3.x feature request — the right shape is a redemption store keyed by token hash, gated by `IFileAccessTokenService`.
+With user binding enabled, the replay window shrinks to "the same authenticated account within the token lifetime." There is still no single-use / nonce-redemption mode in v3. If you need one, track it as a v3.x feature request — the right shape is a redemption store keyed by token hash, gated by `IFileAccessTokenService`.
 
 ---
 
@@ -363,6 +364,7 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](SECURITY-
     "LowDiskWarningBytes": 2147483648,
     "RecompressImages": true,
     "JpegRecompressQuality": 95,
+    "RejectOnRecompressFailure": true,
     "EncryptionEnabled": false,
     "EncryptionSecret": "CHANGE_THIS_TO_A_REAL_SECRET_MINIMUM_32_CHARS",
     "KeyDerivation": {
@@ -389,7 +391,8 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](SECURITY-
     "MaxImagePixels": 40000000
   },
   "FileDownload": {
-    "TokenLifetimeMinutes": 15
+    "TokenLifetimeMinutes": 15,
+    "BindTokensToUser": false
   },
   "VirusScan": {
     "Enabled": false,
@@ -416,7 +419,9 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](SECURITY-
 | `FileUpload:KeyDerivation:Argon2id:*` | Tune for your CPU/RAM budget. Library logs derivation time at startup. |
 | `FileUpload:KeyDerivation:LegacyKekFallback` | `true` (default) keeps PBKDF2 fallback KEKs available for *decryption only*. Set `false` after every file has been re-wrapped. |
 | `FileUpload:RecompressImages` | `true` (default) strips polyglot tails by re-encoding JPEG/PNG/WebP through ImageSharp. |
+| `FileUpload:RejectOnRecompressFailure` | `true` (default, 3.1.0) rejects the upload when the sanitizing re-encode fails — a header that parses but a decode that fails is the shape of a crafted polyglot. Set `false` to restore the pre-3.1.0 store-original-bytes fallback. |
 | `FileDownload:TokenLifetimeMinutes` | Lifetime for opaque download tokens issued by `IFileAccessTokenService`. Default 15 minutes; max 24 hours. |
+| `FileDownload:BindTokensToUser` | `false` (default). When `true`, download tokens are cryptographically bound to the issuing authenticated user; replay from any other account fails verification. |
 | `VirusScan:Enabled` | When `false`, Layer 7 is bypassed. Layers 1–6 + 8 still run. |
 | `VirusScan:ClamAv:MaxStreamBytes` | Must align with `StreamMaxLength` in your `clamd.conf`. |
 

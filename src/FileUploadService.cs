@@ -74,6 +74,20 @@ namespace SecureFileUpload.Services
     }
 
     /// <summary>
+    /// Raised when the sanitizing image re-encode (Gap 1 polyglot-tail mitigation)
+    /// fails and <c>FileUpload:RejectOnRecompressFailure</c> is <see langword="true"/>.
+    /// Caught inside <see cref="FileUploadService.UploadFilesAsync"/> and surfaced
+    /// to the patron as a per-file rejection — never escapes the pipeline.
+    /// </summary>
+    internal sealed class ImageSanitizationException : Exception
+    {
+        public ImageSanitizationException(string message, Exception innerException)
+            : base(message, innerException)
+        {
+        }
+    }
+
+    /// <summary>
     /// Service for handling secure file uploads for remote registration forms.
     ///
     /// Validation pipeline (per file):
@@ -114,6 +128,7 @@ namespace SecureFileUpload.Services
         private readonly bool _failClosedOnUnavailable; // VirusScan:FailClosedOnUnavailable, default false
         private readonly bool _recompressImages;       // Gap 1 mitigation — strips polyglot tails on write
         private readonly int _jpegRecompressQuality;   // 1–100, default 95
+        private readonly bool _rejectOnRecompressFailure; // Gap 1 fail-closed: reject upload when sanitizing re-encode fails
 
         // ── AES-256-GCM file format constants ────────────────────────────
         //
@@ -341,6 +356,12 @@ namespace SecureFileUpload.Services
             _recompressImages = _configuration.GetValue<bool>("FileUpload:RecompressImages", true);
             _jpegRecompressQuality = Math.Clamp(
                 _configuration.GetValue<int>("FileUpload:JpegRecompressQuality", 95), 1, 100);
+            // Fail-closed by default: if the sanitizing re-encode fails, the polyglot-tail
+            // mitigation cannot be applied, so the file is rejected rather than stored
+            // with its original (potentially tail-carrying) bytes. Set false to restore
+            // the pre-3.1.0 fallback-to-original behavior.
+            _rejectOnRecompressFailure = _configuration.GetValue<bool>(
+                "FileUpload:RejectOnRecompressFailure", true);
 
             _encryptionEnabled = _configuration.GetValue<bool>("FileUpload:EncryptionEnabled", false);
             _kdfAlgorithmLabel = "disabled";
@@ -470,7 +491,9 @@ namespace SecureFileUpload.Services
                 _minStorageFreeBytes / 1024 / 1024, _minTempFreeBytes / 1024 / 1024, _lowDiskWarningBytes / 1024 / 1024,
                 _encryptionEnabled ? "AES-256-GCM (envelope/v2)" : "disabled",
                 _kdfAlgorithmLabel,
-                _recompressImages ? $"enabled (JPEG q={_jpegRecompressQuality})" : "disabled",
+                _recompressImages
+                    ? $"enabled (JPEG q={_jpegRecompressQuality}, onFailure={(_rejectOnRecompressFailure ? "reject" : "fallback")})"
+                    : "disabled",
                 _virusScanEnabled ? "enabled" : "disabled",
                 _virusScanService.ScannerName,
                 _failClosedOnUnavailable ? "fail-closed" : "fail-open");
@@ -696,6 +719,19 @@ namespace SecureFileUpload.Services
                         await WriteFileToDiskAsync(file, filePath, newFileName, fileIndex);
                         result.UploadedFilePaths.Add(filePath);
                         fileIndex++;
+                    }
+                    catch (ImageSanitizationException sanitizeEx)
+                    {
+                        // Raised by GetSanitizedPlaintextAsync when the sanitizing
+                        // re-encode fails and RejectOnRecompressFailure is true.
+                        // The file passed layers 1–7, but the polyglot-tail
+                        // mitigation could not be applied — reject rather than
+                        // store the original bytes.
+                        _logger.LogWarning(sanitizeEx,
+                            "SECURITY_EVENT | FILE_SAVE_BLOCKED_SANITIZATION | Path: {Path}", filePath);
+                        result.Errors.Add(
+                            $"File '{SanitizeForLog(file.FileName)}': The image could not be safely processed. " +
+                            "Please re-save or re-export it (for example, open and save it again in an image editor) and try again.");
                     }
                     catch (InvalidOperationException opEx)
                     {
@@ -1104,8 +1140,10 @@ namespace SecureFileUpload.Services
         /// Steps:
         ///   1. Read the upload into memory.
         ///   2. (Gap 1) For JPEG/PNG/WebP, re-encode through ImageSharp to strip any
-        ///      polyglot tail / appended payload. Falls back to original bytes on failure
-        ///      so a malformed-but-valid edge case never blocks an already-validated upload.
+        ///      polyglot tail / appended payload. If the re-encode fails, the upload is
+        ///      rejected by default (FileUpload:RejectOnRecompressFailure=true) so the
+        ///      mitigation cannot be bypassed by a file that parses shallowly but fails
+        ///      a full decode; set the flag false to restore the old fallback behavior.
         ///   3. Either write plaintext to disk, or encrypt with envelope encryption (v2).
         ///
         /// Throws InvalidOperationException if encryption is enabled but no key is available.
@@ -1157,9 +1195,16 @@ namespace SecureFileUpload.Services
         /// ImageSharp emits only the bytes the encoder produces.
         ///
         /// PDF and other types are returned unmodified — recompression is image-only.
-        /// On any decode/encode failure, the original validated bytes are returned and
-        /// the failure is logged. The file already passed all eight validation layers,
-        /// so falling back is preferable to silently rejecting an already-clean upload.
+        ///
+        /// Failure mode is governed by FileUpload:RejectOnRecompressFailure:
+        ///   true (default) — the upload is REJECTED via ImageSanitizationException.
+        ///     Rationale: a file whose header parses (Image.Identify in Layer 6) but
+        ///     whose pixel data fails a full decode is exactly the shape of a crafted
+        ///     polyglot; falling back would store its original bytes with any appended
+        ///     tail intact, silently defeating this mitigation.
+        ///   false — pre-3.1.0 behavior: log a warning and store the original
+        ///     validated bytes. Only choose this if false rejections of unusual but
+        ///     legitimate camera output matter more than the polyglot-tail guarantee.
         /// </summary>
         private async Task<byte[]> GetSanitizedPlaintextAsync(IFormFile file, string extension)
         {
@@ -1200,12 +1245,30 @@ namespace SecureFileUpload.Services
                 _logger.LogInformation(
                     "IMAGE_RECOMPRESSED | Ext: {Ext} | OriginalBytes: {Orig:N0} | SanitizedBytes: {New:N0} | Delta: {Delta:N0}",
                     extension, original.Length, sanitized.Length, sanitized.Length - original.Length);
+                // The original buffer is superseded by the sanitized re-encode —
+                // zero it to keep the patron-content exposure window minimal,
+                // consistent with the plaintext zeroing in WriteFileToDiskAsync.
+                CryptographicOperations.ZeroMemory(original);
                 return sanitized;
             }
             catch (Exception ex)
             {
+                if (_rejectOnRecompressFailure)
+                {
+                    _logger.LogWarning(ex,
+                        "SECURITY_EVENT | IMAGE_RECOMPRESS_FAILED_REJECTED | Ext: {Ext} | " +
+                        "Header parsed but full decode failed — possible crafted polyglot. " +
+                        "Upload rejected (FileUpload:RejectOnRecompressFailure=true).",
+                        extension);
+                    CryptographicOperations.ZeroMemory(original);
+                    throw new ImageSanitizationException(
+                        "Image re-encode failed; upload rejected to preserve the polyglot-tail mitigation.", ex);
+                }
+
                 _logger.LogWarning(ex,
-                    "IMAGE_RECOMPRESS_FAILED | Ext: {Ext} | Falling back to original validated bytes (file already passed all 8 layers).",
+                    "SECURITY_EVENT | IMAGE_RECOMPRESS_FAILED_FALLBACK | Ext: {Ext} | " +
+                    "Storing original validated bytes (FileUpload:RejectOnRecompressFailure=false). " +
+                    "Any data appended after the image's structural end is preserved on disk.",
                     extension);
                 return original;
             }
@@ -1452,7 +1515,10 @@ namespace SecureFileUpload.Services
         /// Renders an attacker-controlled filename safely for use in log messages
         /// and user-facing error strings. Strips control characters, ANSI escape
         /// sequences, log-format injection chars (`|`, `{`, `}`, `\r`, `\n`, `\t`),
-        /// and Unicode bidi/zero-width tricks. Truncates to 128 chars.
+        /// HTML-active characters (`&lt;`, `&gt;`, `"`, `'`) — the output is embedded
+        /// in FileUploadResult.Errors, and a consuming app that renders those errors
+        /// without encoding must not receive markup-capable input — and Unicode
+        /// bidi/zero-width tricks. Truncates to 128 chars.
         /// Mitigates SECURITY-ANALYSIS Finding 4 (log poisoning via filename).
         /// </summary>
         private static string SanitizeForLog(string? fileName)
@@ -1471,6 +1537,12 @@ namespace SecureFileUpload.Services
                     c == '|'  || c == '{'  || c == '}'  ||
                     c == '\u001B' /* ESC */ ||
                     char.IsControl(c))
+                { sb.Append('?'); continue; }
+
+                // Strip HTML-active characters. Error strings containing this value
+                // are returned to end users; if a consumer renders them unencoded,
+                // a filename like "<svg onload=...>.jpg" must not become markup.
+                if (c == '<' || c == '>' || c == '"' || c == '\'')
                 { sb.Append('?'); continue; }
 
                 // Unicode bidi / zero-width / BOM tricks.

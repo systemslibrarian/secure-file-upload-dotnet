@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -6,6 +7,7 @@ using SecureFileUpload.Utilities;
 using System;
 using System.Globalization;
 using System.IO;
+using System.Security.Claims;
 using System.Text;
 
 namespace SecureFileUpload.Services
@@ -14,6 +16,14 @@ namespace SecureFileUpload.Services
     /// Default implementation of <see cref="IFileAccessTokenService"/>.
     /// Uses ASP.NET Core Data Protection to issue opaque, signed download tokens
     /// so staff-facing URLs do not expose storage-relative file paths.
+    ///
+    /// Optional user binding (<c>FileDownload:BindTokensToUser</c>, default
+    /// <see langword="false"/>): when enabled, the authenticated user's identity is
+    /// folded into the Data Protection purpose chain at token creation, and the same
+    /// identity must be present on the request that resolves the token. A token
+    /// leaked to (or replayed by) a different account fails cryptographic
+    /// verification — it is not merely a policy check. Requires
+    /// <see cref="IHttpContextAccessor"/> (registered by <c>AddSecureFileUpload()</c>).
     /// </summary>
     public sealed class FileAccessTokenService : IFileAccessTokenService
     {
@@ -21,8 +31,11 @@ namespace SecureFileUpload.Services
         private readonly IDataProtector _protector;
         private readonly string _storageRoot;
         private readonly TimeSpan _tokenLifetime;
+        private readonly bool _bindTokensToUser;
+        private readonly IHttpContextAccessor? _httpContextAccessor;
 
         private const string ProtectorPurpose = "SecureFileUpload.Services.FileAccessToken.v1";
+        private const string UserBindingPurposePrefix = "user:";
         private const int DefaultTokenLifetimeMinutes = 15;
         private const int MaxTokenLifetimeMinutes = 24 * 60;
 
@@ -30,11 +43,26 @@ namespace SecureFileUpload.Services
             ILogger<FileAccessTokenService> logger,
             IDataProtectionProvider dataProtectionProvider,
             IConfiguration configuration,
-            IFileUploadService uploadService)
+            IFileUploadService uploadService,
+            IHttpContextAccessor? httpContextAccessor = null)
         {
             _logger = logger;
             _protector = dataProtectionProvider.CreateProtector(ProtectorPurpose);
             _storageRoot = uploadService.StorageRoot;
+            _httpContextAccessor = httpContextAccessor;
+
+            _bindTokensToUser = configuration.GetValue<bool>(
+                "FileDownload:BindTokensToUser", false);
+
+            if (_bindTokensToUser && _httpContextAccessor is null)
+            {
+                // Fail fast at startup rather than failing every token operation:
+                // binding cannot work without access to the current request's user.
+                throw new InvalidOperationException(
+                    "FileDownload:BindTokensToUser is true but no IHttpContextAccessor is available. " +
+                    "Register the pipeline via AddSecureFileUpload() (which calls AddHttpContextAccessor()), " +
+                    "or add services.AddHttpContextAccessor() yourself.");
+            }
 
             int configuredLifetimeMinutes = configuration.GetValue<int>(
                 "FileDownload:TokenLifetimeMinutes",
@@ -62,11 +90,18 @@ namespace SecureFileUpload.Services
             if (!IsSafeRelativePath(relativePath))
                 throw new InvalidOperationException("Stored file path cannot be represented as a safe relative token payload.");
 
+            if (!TryResolveProtectorForCurrentUser(out IDataProtector protector))
+            {
+                throw new InvalidOperationException(
+                    "FileDownload:BindTokensToUser is enabled but the current request has no " +
+                    "authenticated user. Refusing to issue an unbound download token.");
+            }
+
             string payload = string.Create(
                 CultureInfo.InvariantCulture,
                 $"{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}|{relativePath}");
 
-            string protectedPayload = _protector.Protect(payload);
+            string protectedPayload = protector.Protect(payload);
             return WebEncoders.Base64UrlEncode(Encoding.UTF8.GetBytes(protectedPayload));
         }
 
@@ -77,11 +112,21 @@ namespace SecureFileUpload.Services
             if (string.IsNullOrWhiteSpace(token))
                 return false;
 
+            if (!TryResolveProtectorForCurrentUser(out IDataProtector protector))
+            {
+                _logger.LogWarning(
+                    "SECURITY_EVENT | FILE_TOKEN_REJECTED_NO_SUBJECT | " +
+                    "BindTokensToUser is enabled but the current request has no authenticated user.");
+                return false;
+            }
+
             string payload;
             try
             {
                 string protectedPayload = Encoding.UTF8.GetString(WebEncoders.Base64UrlDecode(token));
-                payload = _protector.Unprotect(protectedPayload);
+                // With user binding enabled, a token created for a different user fails
+                // here with a CryptographicException — the purpose chains differ.
+                payload = protector.Unprotect(protectedPayload);
             }
             catch (Exception ex)
             {
@@ -124,6 +169,37 @@ namespace SecureFileUpload.Services
                 return false;
 
             storedFilePath = fullPath;
+            return true;
+        }
+
+        /// <summary>
+        /// Resolves the protector to use for the current request.
+        /// Unbound mode: always the base protector. Bound mode: the base protector
+        /// extended with a purpose derived from the authenticated user's stable
+        /// identifier (<see cref="ClaimTypes.NameIdentifier"/>, falling back to
+        /// <c>Identity.Name</c>). Returns <see langword="false"/> when binding is
+        /// enabled but no authenticated subject exists — callers must fail closed.
+        /// </summary>
+        private bool TryResolveProtectorForCurrentUser(out IDataProtector protector)
+        {
+            if (!_bindTokensToUser)
+            {
+                protector = _protector;
+                return true;
+            }
+
+            ClaimsPrincipal? user = _httpContextAccessor?.HttpContext?.User;
+            string? subject = user?.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            if (string.IsNullOrEmpty(subject) && user?.Identity?.IsAuthenticated == true)
+                subject = user.Identity.Name;
+
+            if (string.IsNullOrEmpty(subject))
+            {
+                protector = _protector;
+                return false;
+            }
+
+            protector = _protector.CreateProtector(UserBindingPurposePrefix + subject);
             return true;
         }
 

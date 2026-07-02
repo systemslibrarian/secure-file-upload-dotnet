@@ -19,10 +19,10 @@
 
     <!-- ── NuGet package metadata ─────────────────────────────────────── -->
     <PackageId>SecureFileUpload.Core</PackageId>
-    <Version>3.0.3</Version>
-    <AssemblyVersion>3.0.0.0</AssemblyVersion>
-    <FileVersion>3.0.3.0</FileVersion>
-    <InformationalVersion>3.0.3</InformationalVersion>
+    <Version>3.1.0</Version>
+    <AssemblyVersion>3.1.0.0</AssemblyVersion>
+    <FileVersion>3.1.0.0</FileVersion>
+    <InformationalVersion>3.1.0</InformationalVersion>
     <Authors>Paul Clark (systemslibrarian)</Authors>
     <Company>systemslibrarian</Company>
     <Product>SecureFileUpload.Core</Product>
@@ -38,6 +38,42 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryBranch>main</RepositoryBranch>
     <PackageReleaseNotes>
+v3.1.0 — fail-closed sanitization, user-bound download tokens, config guards.
+
+No public API break — one optional constructor parameter added to
+FileAccessTokenService (DI-resolved; existing call sites compile unchanged).
+One deliberate behavioral change, revertible by config:
+
+  • Image recompression now FAILS CLOSED (Gap 1). If the sanitizing
+    re-encode fails, the upload is rejected instead of falling back to the
+    original bytes — a header that parses but a decode that fails is the
+    exact shape of a crafted polyglot, and the old fallback silently kept
+    any appended tail on disk. Restore the pre-3.1.0 behavior with
+    FileUpload:RejectOnRecompressFailure=false.
+  • Download tokens can be cryptographically bound to the issuing user:
+    FileDownload:BindTokensToUser (default false). When enabled, the
+    authenticated user's identity is folded into the Data Protection
+    purpose chain — a token replayed by a different account fails
+    verification, and issuing a token on an unauthenticated request
+    throws. AddSecureFileUpload() now registers IHttpContextAccessor.
+  • User-facing error strings no longer echo HTML-active characters
+    (&lt;, &gt;, quotes) from attacker-controlled filenames — SanitizeForLog
+    neutralizes them so a consumer rendering FileUploadResult.Errors
+    without encoding cannot be handed markup.
+  • Windows Defender scan timeout now clamps with a lower bound of 1s
+    (matching ClamAV). A configured 0 previously made every scan time out
+    instantly — silently disabling scanning under fail-open availability.
+  • ClamAV MaxStreamBytes ≤ 0 now falls back to the 25 MiB default with a
+    warning instead of failing every scan.
+  • Supply chain: GitHub Actions pinned to commit SHAs; Dependabot enabled
+    for nuget + github-actions ecosystems.
+  • New HardeningV310Tests cover fail-closed/fallback recompression, valid
+    image round-trip, HTML-neutralized error output, and the token-binding
+    matrix (same-user resolve, cross-user replay rejection, anonymous
+    issuance refusal, unbound default round-trip).
+  • No change to the 8-layer pipeline order, on-disk envelope formats,
+    Argon2id KEK derivation, or legacy PBKDF2 decrypt fallback.
+
 v3.0.3 — defense-in-depth hardening (backward-compatible patch).
 
 No public API break. AssemblyVersion stays at 3.0.0.0 so this is a drop-in

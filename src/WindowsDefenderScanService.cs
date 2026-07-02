@@ -63,7 +63,10 @@ namespace SecureFileUpload.Services
 
             var configuredTimeout = _configuration.GetValue<int>(
                 "VirusScan:WindowsDefender:TimeoutSeconds", DefaultTimeoutSeconds);
-            _timeoutSeconds = Math.Min(configuredTimeout, MaxTimeoutSeconds);
+            // Clamp with a lower bound of 1 (matching ClamAvScanService): a configured
+            // value of 0 or below would make every scan time out instantly, silently
+            // turning scanning off under the fail-open availability default.
+            _timeoutSeconds = Math.Clamp(configuredTimeout, 1, MaxTimeoutSeconds);
 
             // Log startup availability (informational only — not cached)
             if (!File.Exists(_mpCmdRunPath))

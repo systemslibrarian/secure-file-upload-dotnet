@@ -15,6 +15,13 @@ This document exists because intellectual honesty matters more than looking good
 > **Configuration:**
 > - `FileUpload:RecompressImages` (default `true`) — set `false` to keep original bytes if quality is critical.
 > - `FileUpload:JpegRecompressQuality` (default `95`, clamped 1–100) — JPEG output quality.
+> - `FileUpload:RejectOnRecompressFailure` (default `true`, since 3.1.0) — when the sanitizing
+>   re-encode fails, the upload is **rejected** rather than stored with its original bytes.
+>   Before 3.1.0 the mitigation failed open: a file whose header parsed (so `Image.Identify`
+>   and the structural walkers passed) but whose pixel data failed a full decode fell back
+>   to the original bytes — keeping any appended tail intact, which is precisely the input
+>   shape a crafted polyglot presents. Set `false` only if you must never reject unusual
+>   but legitimate camera output, and accept the reopened gap.
 >
 > The historical rationale below is retained for context.
 

@@ -1,0 +1,17 @@
+# Keep dependencies patched automatically. NuGet coverage matters here because
+# ImageSharp is fed attacker-controlled bytes by design — security advisories
+# for it (and the other runtime deps) should open PRs without anyone watching.
+# The github-actions ecosystem keeps the SHA-pinned workflow steps current
+# (Dependabot updates the pinned SHA and the version comment together).
+version: 2
+updates:
+  - package-ecosystem: "nuget"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
