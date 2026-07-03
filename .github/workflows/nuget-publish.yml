@@ -120,6 +120,12 @@ jobs:
         run: dotnet build tests/Fuzz/FuzzHarness.csproj --configuration Release --no-restore
 
   # ── Publish to NuGet.org — only on version tags ───────────────────────
+  #
+  # Authentication uses NuGet.org Trusted Publishing (OIDC): the NuGet/login
+  # action exchanges this job's GitHub OIDC token for a short-lived API key.
+  # No long-lived NUGET_API_KEY secret exists anywhere. The trust policy is
+  # configured on nuget.org (profile → Trusted Publishing) and is scoped to
+  # this repository + this workflow file + the 'nuget-publish' environment.
   publish:
     name: Publish to NuGet.org
     runs-on: ubuntu-latest
@@ -128,6 +134,7 @@ jobs:
 
     permissions:
       contents: read
+      id-token: write   # required to mint the OIDC token for Trusted Publishing
 
     environment:
       name: nuget-publish
@@ -148,18 +155,15 @@ jobs:
           path: nupkgs
         continue-on-error: true   # symbol upload is non-fatal
 
-      - name: Validate NuGet API key is configured
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-        run: |
-          if [ -z "$NUGET_API_KEY" ]; then
-            echo "::error::Missing NUGET_API_KEY secret. Add it in Settings > Secrets and variables > Actions (repo secret) or Environment secrets for 'nuget-publish'."
-            exit 1
-          fi
+      - name: NuGet.org login (Trusted Publishing / OIDC)
+        id: nuget-login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: systemslibrarian
 
       - name: Push to NuGet.org
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: >
           dotnet nuget push nupkgs/*.nupkg
           --api-key "$NUGET_API_KEY"
@@ -168,7 +172,7 @@ jobs:
 
       - name: Push symbols to NuGet.org
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: |
           shopt -s nullglob
           snupkgs=(nupkgs/*.snupkg)
@@ -181,6 +185,6 @@ jobs:
             --api-key "$NUGET_API_KEY" \
             --source https://api.nuget.org/v3/index.json \
             --skip-duplicate
-        # NUGET_API_KEY must be set in the repository's
-        # Settings → Secrets → Actions → New repository secret.
-        # Scope the key to this package only in your NuGet.org account.
+        # The API key above is a short-lived token minted by NuGet/login via
+        # Trusted Publishing — it expires shortly after the run and there is
+        # no long-lived publish credential to rotate or leak.
