@@ -695,6 +695,12 @@ namespace SecureFileUpload.Services
                                 // Fail-closed on availability — refuse the file
                                 // even though it passed Layers 1–6. The skip metric
                                 // above is the operator-facing signal.
+                                //
+                                // Counted here rather than after the write, because there is
+                                // no write to wait for: the file is being refused. The count
+                                // must still fire so operators get one uniform skip signal in
+                                // both fail-open and fail-closed modes.
+                                scanNotScanned++;
                                 result.Errors.Add(
                                     $"File '{SanitizeForLog(file.FileName)}': scanner unavailable; upload rejected (fail-closed policy).");
                                 continue;

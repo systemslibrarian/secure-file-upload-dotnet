@@ -698,8 +698,8 @@ namespace SecureFileUpload.Services
         ///     with no opener, sets <paramref name="malformed"/>. The caller MUST fail
         ///     closed on that flag rather than scanning a truncated result.
         ///
-        /// Stripped payloads are not simply discarded: when <paramref name="streamRanges"/> is
-        /// supplied, the source offsets of each stream's data are recorded so
+        /// Stripped payloads are not simply discarded: the overload taking a stream-range
+        /// collector records the source offsets of each stream's data, so
         /// ScanCompressedPdfStreams can inflate exactly those ranges and scan the decompressed
         /// dictionaries. Because the ranges come from this lexer rather than a substring search,
         /// the scan cannot be misdirected by a "stream" occurring inside a name, comment, or
