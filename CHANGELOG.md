@@ -5,6 +5,92 @@ follows semantic versioning. `AssemblyVersion` is held at `3.0.0.0` across the
 entire `3.0.x` line so patch releases are drop-in upgrades with no
 binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`.
 
+## 3.2.0 — 2026-07-26 — Token-aware PDF lexing, real-world false-rejection fixes
+
+No public API break. `FileContentValidatorOptions` gains one property
+(`RejectPdfObjectStreams`); three existing defaults change (see *Changed*),
+all revertible by config.
+
+This release back-ports the deep content validator rework from the production
+intake application this package was lifted from, and merges it with the
+compressed-stream scanner that only existed here. Neither side had both.
+
+### Added
+
+- **`FileUpload:ContentValidation:RejectPdfObjectStreams`** (default `false`).
+  Object streams (`/ObjStm`) are standard in PDF 1.5+ — Word, Acrobat, browser
+  "Print to PDF", and every mainstream phone scanner app emit them — so they
+  are accepted and their contents scanned rather than refused. Operators with a
+  controlled producer set can flip this to `true`.
+- **Compressed-stream contents are now name-scanned.** `ScanCompressedPdfStreams`
+  inflates stripped stream payloads and runs the same name-object extraction over
+  the decompressed dictionaries, so `/JavaScript` or `/Launch` declared inside an
+  object stream is found. Previously the interior was matched by raw substring,
+  which both missed hex-escaped spellings and false-positived on `/JSON`.
+- **PDF name-object lexer** — `/JS`, `/Launch`, `/OpenAction` and friends are
+  matched by extracting real name objects and decoding `#xx` hex escapes.
+- **Image metadata-region scoping** — text threat scans on JPEG/PNG/WebP/GIF are
+  confined to metadata and comment segments (JPEG `APPn`/`COM`, PNG
+  `tEXt`/`iTXt`/`zTXt`, WebP `EXIF`/`XMP`, GIF comment/application) instead of
+  running across entropy-coded pixel data.
+- **Compressed PNG text chunks are inflated before scanning** (`zTXt`, and
+  `iTXt` with the compression flag set), with per-chunk and total output bounds.
+- **Atomic upload writes** — files are written to a temporary sibling and moved
+  into place, so an interrupted write never leaves a partial file at the
+  destination. Success is logged only after the move.
+- **Storage-root containment on decrypt** — `GetDecryptedFileStreamAsync`
+  normalizes the path, enforces containment under the storage root, and rejects
+  reparse points in every path component.
+
+### Changed
+
+- **`RejectPdfObjectStreams` defaults to `false`** (was: object streams rejected
+  outright). Their contents are now inflated and scanned, so this is a net
+  increase in inspection coverage, not a relaxation.
+- **Post-EOI JPEG data is scanned but no longer rejected** for failing to match a
+  recognized container. The old allowlist refused MPF second images (Samsung,
+  Sony, Fujifilm), Samsung Motion Photo SEF footers, and alignment padding — the
+  most common trailers in the wild. Detection now comes from scanning the bytes.
+- **Image dimension caps raised** to 30000 px / 300 MP (from 10000 px / 40 MP).
+  These guard against decompression pixel bombs only; the previous values
+  false-rejected ordinary 48–200 MP smartphone photos.
+- **`VirusScanOutcome.NotScanned` split into `Disabled` and `Unavailable`** so
+  "no scanner configured" and "configured scanner failed" are distinguishable in
+  logs. Both remain fail-open and both count toward `ScanNotScannedCount`.
+- **Scan counters are incremented only after storage succeeds**, so a file that
+  is scanned and then fails to write is no longer reported as stored. The
+  fail-closed rejection path still counts, because `ScanNotScannedCount` is the
+  uniform skip signal operators alert on in both availability modes.
+- **`SixLabors.ImageSharp` pinned to `[3.1.11,4.0.0)`.** ImageSharp moved to a
+  commercial Six Labors license at v4 — the build fails without a paid license
+  key, and shipping it would push that obligation onto every consumer of this
+  package. The range still admits 3.1.x security patches, which matters because
+  ImageSharp is fed attacker-controlled bytes by design.
+
+### Fixed
+
+- **`StripPdfStreamPayloads` treats `stream` as a lexical token.** A plain
+  `IndexOf` matched inside comments, literal strings, and names such as
+  `/upstream`, which discarded the rest of the document and hid every dangerous
+  token that followed. The compressed-stream scanner is now driven by the same
+  lexer rather than its own substring search.
+- **`FindPdfToken` no longer treats `(` and `%` as string and comment markers
+  while searching raw stream data**, where both are ordinary bytes. That
+  mis-parse swallowed the real `endstream` and structurally rejected any PDF
+  whose producer writes an indirect `/Length` — Ghostscript, MFP firmware, and
+  PDF/A converters among them.
+- **Threat scans iterate every occurrence of a pattern** instead of stopping at
+  the first; a short decoy that failed the printable-run gate used to abandon
+  the pattern entirely.
+- **Metadata regions are delimited** so a pattern cannot be synthesized across
+  the boundary of two unrelated segments.
+- **JPEG end-of-image is located by walking segments and the entropy-coded
+  scan**, which makes post-EOI data findable and therefore scannable at all.
+- **Ambiguous PHP short-open-tag patterns removed**, ending false-positive
+  `JPEG-EmbeddedShell` rejections of legitimate phone photos.
+- **Cancellation is checked before deep validation** for every file type, not
+  only for PDFs that happen to carry a compressed stream.
+
 ## 3.1.0 — 2026-07-02 — Fail-closed sanitization, user-bound download tokens
 
 No public API break — `FileAccessTokenService` gains one optional constructor

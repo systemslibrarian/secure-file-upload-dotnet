@@ -665,10 +665,12 @@ namespace SecureFileUpload.Services
                     // -- Layer 7: Virus scan (only when enabled in config) -----
                     var scanOutcome = await RunVirusScanAsync(file, formType, sanitizedLastName, submissionFolder);
 
+                    // NOTE: the scan counters are deliberately NOT incremented here. They are
+                    // incremented after the write succeeds, so a file that is scanned and then
+                    // fails to store is not reported as stored-and-clean.
                     switch (scanOutcome)
                     {
                         case VirusScanOutcome.Clean:
-                            scanClean++;
                             break;
 
                         case VirusScanOutcome.Infected:
@@ -676,20 +678,29 @@ namespace SecureFileUpload.Services
                             infectedRejected++;
                             continue; // skip writing this file
 
-                        case VirusScanOutcome.NotScanned:
+                        case VirusScanOutcome.Disabled:
+                        case VirusScanOutcome.Unavailable:
                             // Uniform skip metric — emitted in BOTH fail-open and
                             // fail-closed modes so operators can alert on a single
-                            // signal regardless of the configured policy.
+                            // signal regardless of the configured policy. Reason
+                            // distinguishes "no scanner configured" from "scanner failed".
                             _logger.LogWarning(
-                                "SECURITY_EVENT | VIRUS_SCAN_SKIPPED | Reason: ScannerUnavailableOrDisabled | FailClosed: {FailClosed} | Scanner: {Scanner} | FileName: {FileName} | Form: {FormType}",
+                                "SECURITY_EVENT | VIRUS_SCAN_SKIPPED | Reason: {Reason} | FailClosed: {FailClosed} | Scanner: {Scanner} | FileName: {FileName} | Form: {FormType}",
+                                scanOutcome == VirusScanOutcome.Disabled ? "ScanningDisabled" : "ScannerUnavailable",
                                 _failClosedOnUnavailable, _virusScanService.ScannerName,
                                 SanitizeForLog(file.FileName), formType);
-                            scanNotScanned++;
+
                             if (_failClosedOnUnavailable && _virusScanEnabled)
                             {
                                 // Fail-closed on availability — refuse the file
                                 // even though it passed Layers 1–6. The skip metric
                                 // above is the operator-facing signal.
+                                //
+                                // Counted here rather than after the write, because there is
+                                // no write to wait for: the file is being refused. The count
+                                // must still fire so operators get one uniform skip signal in
+                                // both fail-open and fail-closed modes.
+                                scanNotScanned++;
                                 result.Errors.Add(
                                     $"File '{SanitizeForLog(file.FileName)}': scanner unavailable; upload rejected (fail-closed policy).");
                                 continue;
@@ -719,6 +730,11 @@ namespace SecureFileUpload.Services
                         await WriteFileToDiskAsync(file, filePath, newFileName, fileIndex);
                         result.UploadedFilePaths.Add(filePath);
                         fileIndex++;
+
+                        // Counted only now that the file is actually stored, so the reported
+                        // clean/unscanned totals always describe files that exist on disk.
+                        if (scanOutcome == VirusScanOutcome.Clean) scanClean++;
+                        else scanNotScanned++;
                     }
                     catch (ImageSanitizationException sanitizeEx)
                     {
@@ -880,11 +896,53 @@ namespace SecureFileUpload.Services
         /// </summary>
         public async Task<(Stream? Stream, string ContentType)> GetDecryptedFileStreamAsync(string filePath)
         {
+            const string fallbackContentType = "application/octet-stream";
+
+            if (string.IsNullOrWhiteSpace(filePath))
+            {
+                _logger.LogWarning("SECURITY_EVENT | FILE_DECRYPT_INVALID_PATH | Empty path rejected");
+                return (null, fallbackContentType);
+            }
+
+            // Normalize before any comparison: without this, "..", alternate separators, and
+            // short-name forms would each defeat the containment check below.
+            try
+            {
+                filePath = Path.GetFullPath(filePath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "SECURITY_EVENT | FILE_DECRYPT_INVALID_PATH | Path could not be normalized");
+                return (null, fallbackContentType);
+            }
+
             var contentType = GetContentType(filePath);
+
+            // This method decrypts with the master key, so it must only ever be pointed at
+            // storage this service owns. A caller passing an arbitrary path would otherwise
+            // turn it into a decrypting arbitrary-file-read primitive.
+            if (!PathHelper.IsPathUnderBase(filePath, _storageRoot))
+            {
+                _logger.LogWarning(
+                    "SECURITY_EVENT | FILE_DECRYPT_PATH_OUTSIDE_STORAGE | Path: {Path} | StorageRoot: {StorageRoot}",
+                    filePath, _storageRoot);
+                return (null, contentType);
+            }
 
             if (!File.Exists(filePath))
             {
                 _logger.LogWarning("FILE_DECRYPT_NOT_FOUND | File not found at {Path}", filePath);
+                return (null, contentType);
+            }
+
+            // Containment above is a string comparison, so a symlink or junction anywhere
+            // below the storage root could still redirect the read outside it.
+            if (HasReparsePointBelowStorageRoot(filePath))
+            {
+                _logger.LogWarning(
+                    "SECURITY_EVENT | FILE_DECRYPT_LINK_REJECTED | Path: {Path} | StorageRoot: {StorageRoot}",
+                    filePath, _storageRoot);
                 return (null, contentType);
             }
 
@@ -920,6 +978,40 @@ namespace SecureFileUpload.Services
                 _logger.LogError(ex, "FILE_DECRYPT_ERROR | Failed to read/decrypt {Path}", filePath);
                 return (null, contentType);
             }
+        }
+
+        /// <summary>
+        /// Rejects symbolic links and Windows reparse points in every existing path
+        /// component below the trusted storage root. Lexical containment alone does not
+        /// prevent an in-root link from resolving to a file elsewhere on the filesystem.
+        /// Any attribute lookup failure is treated as unsafe.
+        /// </summary>
+        private bool HasReparsePointBelowStorageRoot(string filePath)
+        {
+            string relativePath = Path.GetRelativePath(_storageRoot, filePath);
+            string currentPath = _storageRoot;
+            string[] components = relativePath.Split(
+                new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (string component in components)
+            {
+                currentPath = Path.Combine(currentPath, component);
+                try
+                {
+                    if ((File.GetAttributes(currentPath) & FileAttributes.ReparsePoint) != 0)
+                        return true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "SECURITY_EVENT | FILE_DECRYPT_ATTRIBUTE_CHECK_FAILED | Path: {Path}",
+                        currentPath);
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private (Stream? Stream, string ContentType) LogUnsupportedVersion(string filePath, byte version, string contentType)
@@ -1067,15 +1159,23 @@ namespace SecureFileUpload.Services
         /// Virus scan outcome — replaces the previous goto-based control flow
         /// with an explicit enum for clarity.
         /// </summary>
-        private enum VirusScanOutcome { Clean, Infected, NotScanned }
+        /// <summary>
+        /// Virus scan outcome.
+        ///
+        /// Disabled and Unavailable are distinct for operational logging — "no scanner is
+        /// configured" and "a configured scanner failed" call for different responses — but
+        /// both remain fail-open and count toward ScanNotScannedCount.
+        /// </summary>
+        private enum VirusScanOutcome { Clean, Infected, Disabled, Unavailable }
 
         /// <summary>
         /// Runs the virus scan pipeline for a single file.
         ///
         /// Scan policy:
+        ///   - Scanning disabled in config    → accept, return Disabled
         ///   - Scanner says clean            → accept, return Clean
         ///   - Scanner says infected          → return Infected (caller rejects)
-        ///   - Scanner unavailable/error      → accept, return NotScanned
+        ///   - Scanner unavailable/error      → accept, return Unavailable
         ///     (file already passed all validation layers 1–6)
         ///   - Never map unavailable to Clean
         ///   - Never reject solely because scanner is unavailable
@@ -1085,8 +1185,8 @@ namespace SecureFileUpload.Services
         {
             if (!_virusScanEnabled)
             {
-                _logger.LogDebug("VIRUS_SCAN_NOT_SCANNED | VirusScan:Enabled=false");
-                return VirusScanOutcome.NotScanned;
+                _logger.LogDebug("VIRUS_SCAN_DISABLED | VirusScan:Enabled=false");
+                return VirusScanOutcome.Disabled;
             }
 
             _logger.LogInformation(
@@ -1101,13 +1201,13 @@ namespace SecureFileUpload.Services
             catch (Exception ex)
             {
                 // Scanner threw an exception (timeout, connection refused, crash).
-                // File passed all validation — accept but mark as NotScanned.
+                // File passed all validation — accept but mark as unscanned.
                 _logger.LogWarning(ex,
-                    "VIRUS_SCAN_ERROR | Scanner: {Scanner} | File: {FileName} | FormType: {FormType} | " +
-                    "File accepted as NotScanned (passed validation layers 1–6). " +
+                    "SECURITY_EVENT | VIRUS_SCAN_UNAVAILABLE | Scanner: {Scanner} | File: {FileName} | FormType: {FormType} | " +
+                    "File accepted unscanned (passed validation layers 1–6). " +
                     "Scanner exception does not block validated uploads.",
                     _virusScanService.ScannerName, SanitizeForLog(file.FileName), formType);
-                return VirusScanOutcome.NotScanned;
+                return VirusScanOutcome.Unavailable;
             }
 
             if (scanResult.ScanSuccessful && scanResult.IsClean)
@@ -1128,10 +1228,10 @@ namespace SecureFileUpload.Services
 
             // Scanner returned but scan was not successful (unavailable, error, timeout).
             _logger.LogWarning(
-                "VIRUS_SCAN_OPERATIONAL_FAILURE | Scanner: {Scanner} | File: {FileName} | Message: {Msg} | FormType: {FormType} | " +
-                "File accepted as NotScanned (passed validation layers 1–6).",
+                "SECURITY_EVENT | VIRUS_SCAN_UNAVAILABLE | Scanner: {Scanner} | File: {FileName} | Message: {Msg} | FormType: {FormType} | " +
+                "File accepted unscanned (passed validation layers 1–6).",
                 _virusScanService.ScannerName, SanitizeForLog(file.FileName), SanitizeForLog(scanResult.Message), formType);
-            return VirusScanOutcome.NotScanned;
+            return VirusScanOutcome.Unavailable;
         }
 
         /// <summary>
@@ -1163,28 +1263,58 @@ namespace SecureFileUpload.Services
             var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
             byte[] plaintext = await GetSanitizedPlaintextAsync(file, extension);
 
+            // Write to a temporary sibling, then move it into place. An interrupted or failed
+            // write therefore never leaves a partial file at the destination, where a later
+            // read would have no way to tell it apart from a complete upload. The temp name is
+            // dot-prefixed and randomised so it neither collides nor is served if the storage
+            // directory is ever exposed.
+            string directory = Path.GetDirectoryName(filePath)
+                ?? throw new InvalidOperationException("Upload destination has no parent directory.");
+            string tempPath = Path.Combine(
+                directory, $".{Path.GetFileName(filePath)}.{GenerateRandomString(12)}.tmp");
+
             try
             {
-                if (_encryptionEnabled && _encryptionKey != null)
-                {
-                    await WriteEnvelopeEncryptedAsync(plaintext, filePath, _encryptionKey);
+                bool encrypted = _encryptionEnabled && _encryptionKey != null;
+
+                if (encrypted)
+                    await WriteEnvelopeEncryptedAsync(plaintext, tempPath, _encryptionKey!);
+                else
+                    await File.WriteAllBytesAsync(tempPath, plaintext);
+
+                // overwrite: false — refuse to clobber an existing file rather than silently
+                // replacing one. Names are already collision-resistant upstream, so a
+                // collision here indicates a bug or a race worth surfacing.
+                File.Move(tempPath, filePath, overwrite: false);
+
+                // Logged only after the file is in its final location, so a success line in
+                // the log always corresponds to a fully written, readable file.
+                if (encrypted)
                     _logger.LogInformation(
                         "FILE_ENCRYPT_SUCCESS | Format: GCM-v2-Envelope | SavedAs: {NewName} | OriginalSize: {Orig:N0} | StoredSize: {Stored:N0} | Index: {Index}",
                         newFileName, file.Length, plaintext.Length + GcmV2HeaderSize, fileIndex);
-                }
                 else
-                {
-                    await File.WriteAllBytesAsync(filePath, plaintext);
                     _logger.LogInformation(
                         "FILE_SAVED | SavedAs: {NewName} | Size: {Size:N0} bytes | Index: {Index}",
                         newFileName, plaintext.Length, fileIndex);
-                }
             }
             finally
             {
                 // Zero plaintext as soon as possible to minimize exposure in memory.
                 // Not a guarantee (GC may have copies) but reduces the window.
                 CryptographicOperations.ZeroMemory(plaintext);
+
+                // Remove the temp file if the move never happened. Best-effort: a failure to
+                // clean up must not mask the original exception.
+                try
+                {
+                    if (File.Exists(tempPath)) File.Delete(tempPath);
+                }
+                catch (Exception cleanupEx)
+                {
+                    _logger.LogWarning(
+                        "UPLOAD_TEMP_CLEANUP_FAILED | Reason: {Reason}", cleanupEx.Message);
+                }
             }
         }
 
