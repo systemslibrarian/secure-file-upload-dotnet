@@ -207,8 +207,20 @@ decryption compatibility are unchanged from 2.0.0.
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Image identification + recompression (polyglot-tail mitigation) -->
-    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
+    <!--
+      Image identification + recompression (polyglot-tail mitigation).
+
+      Pinned BELOW 4.0.0 deliberately. ImageSharp moved to a commercial Six Labors
+      license at v4: the build fails with "No Six Labors license found" unless a paid
+      license key is supplied, and shipping it would push that obligation onto every
+      consumer of this package. 3.1.x remains available under the Six Labors Split
+      License, which covers open-source use.
+
+      The range still admits 3.1.x patches, which matters — ImageSharp is fed
+      attacker-controlled bytes by design, so its security advisories must keep
+      reaching this package. Revisit only if a Six Labors license is acquired.
+    -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="[3.1.11,4.0.0)" />
 
     <!--
       Argon2id key derivation for the master Key Encryption Key (KEK).

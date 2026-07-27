@@ -58,7 +58,14 @@ compressed-stream scanner that only existed here. Neither side had both.
   "no scanner configured" and "configured scanner failed" are distinguishable in
   logs. Both remain fail-open and both count toward `ScanNotScannedCount`.
 - **Scan counters are incremented only after storage succeeds**, so a file that
-  is scanned and then fails to write is no longer reported as stored.
+  is scanned and then fails to write is no longer reported as stored. The
+  fail-closed rejection path still counts, because `ScanNotScannedCount` is the
+  uniform skip signal operators alert on in both availability modes.
+- **`SixLabors.ImageSharp` pinned to `[3.1.11,4.0.0)`.** ImageSharp moved to a
+  commercial Six Labors license at v4 — the build fails without a paid license
+  key, and shipping it would push that obligation onto every consumer of this
+  package. The range still admits 3.1.x security patches, which matters because
+  ImageSharp is fed attacker-controlled bytes by design.
 
 ### Fixed
 
