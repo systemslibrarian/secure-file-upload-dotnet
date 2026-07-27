@@ -38,6 +38,49 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryBranch>main</RepositoryBranch>
     <PackageReleaseNotes>
+v3.2.0 — token-aware PDF lexing, real-world false-rejection fixes.
+
+No public API break. FileContentValidatorOptions gains RejectPdfObjectStreams;
+three defaults change, all revertible by config.
+
+This release merges the deep content validator rework from the production
+intake application this package was lifted from with the compressed-stream
+scanner that only existed here — neither side had both.
+
+  • PDF tokens are matched by extracting real name objects and decoding #xx
+    hex escapes, closing the /J#53 spelling bypass and removing /JSON false
+    positives. StripPdfStreamPayloads now treats "stream" as a lexical token
+    rather than a substring: a plain IndexOf matched inside comments, literal
+    strings, and names like /upstream, discarding the rest of the document
+    and hiding every dangerous token that followed.
+  • The FlateDecode compressed-stream scanner is driven by that same lexer
+    instead of its own substring search, and identifies threats by name
+    extraction. Object-stream interiors are now inspected with hex-escape
+    decoding for the first time.
+  • RejectPdfObjectStreams defaults to FALSE. Object streams are standard in
+    PDF 1.5+, so rejecting them refused output from Word, Acrobat, browser
+    print, and every mainstream phone scanner app. Coverage does not regress
+    — their contents are now inflated and name-scanned.
+  • Post-EOI JPEG data is scanned but no longer rejected for failing to match
+    a recognized container; the old allowlist refused MPF second images,
+    Samsung Motion Photo SEF footers, and alignment padding.
+  • Image dimension caps raised to 30000 px / 300 MP. The previous values
+    false-rejected ordinary 48–200 MP smartphone photos. These guard against
+    decompression pixel bombs only.
+  • Image text threat scans are confined to metadata and comment segments,
+    so coincidental byte patterns in entropy-coded pixel data no longer
+    false-reject legitimate photos. Compressed PNG text chunks (zTXt, iTXt)
+    are inflated before scanning, with output bounds.
+  • Uploads are written to a temp file and moved into place, so an
+    interrupted write leaves no partial file. GetDecryptedFileStreamAsync
+    enforces storage-root containment and rejects reparse points in any path
+    component. Virus scan outcomes distinguish Disabled from Unavailable.
+  • SixLabors.ImageSharp pinned to [3.1.11,4.0.0): ImageSharp moved to a
+    commercial license at v4, which would push that obligation onto every
+    consumer. The range still admits 3.1.x security patches.
+  • No change to the 8-layer pipeline order, on-disk envelope formats,
+    Argon2id KEK derivation, or the legacy PBKDF2 decrypt fallback.
+
 v3.1.0 — fail-closed sanitization, user-bound download tokens, config guards.
 
 No public API break — one optional constructor parameter added to
