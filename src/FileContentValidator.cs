@@ -70,8 +70,9 @@ namespace SecureFileUpload.Services
         ///
         /// Operators running a stricter policy — one where every patron PDF is known to come
         /// from a controlled producer — can set this true in configuration
-        /// (FileUpload:ContentValidation:RejectPdfObjectStreams). Expect false rejections of
-        /// ordinary modern PDFs if you do.
+        /// (FileContent:RejectPdfObjectStreams — AddSecureFileUpload binds
+        /// FileContentValidatorOptions to the top-level "FileContent" section). Expect false
+        /// rejections of ordinary modern PDFs if you do.
         /// </summary>
         public bool RejectPdfObjectStreams { get; set; } = false;
 

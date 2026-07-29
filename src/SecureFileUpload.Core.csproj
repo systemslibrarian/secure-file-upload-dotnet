@@ -19,10 +19,16 @@
 
     <!-- ── NuGet package metadata ─────────────────────────────────────── -->
     <PackageId>SecureFileUpload.Core</PackageId>
-    <Version>3.2.0</Version>
+    <Version>3.2.1</Version>
+    <!--
+      AssemblyVersion deliberately held at 3.2.0.0. 3.2.1 is a documentation patch:
+      no IL changed, only comments, package metadata, and markdown. Holding the
+      assembly version makes this a drop-in upgrade from 3.2.0 with no
+      binding-redirect churn on frameworks that use them.
+    -->
     <AssemblyVersion>3.2.0.0</AssemblyVersion>
-    <FileVersion>3.2.0.0</FileVersion>
-    <InformationalVersion>3.2.0</InformationalVersion>
+    <FileVersion>3.2.1.0</FileVersion>
+    <InformationalVersion>3.2.1</InformationalVersion>
     <Authors>Paul Clark (systemslibrarian)</Authors>
     <Company>systemslibrarian</Company>
     <Product>SecureFileUpload.Core</Product>
@@ -38,6 +44,26 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryBranch>main</RepositoryBranch>
     <PackageReleaseNotes>
+v3.2.1 — documentation patch. No code, IL, or on-disk format change.
+
+AssemblyVersion stays at 3.2.0.0 — drop-in upgrade from 3.2.0.
+
+  • CORRECTED CONFIG KEY: the 3.2.0 notes and CHANGELOG documented the new
+    PDF object-stream switch as FileUpload:ContentValidation:RejectPdfObjectStreams.
+    The real key is FileContent:RejectPdfObjectStreams — AddSecureFileUpload()
+    binds FileContentValidatorOptions to the top-level "FileContent" section, so
+    every property on that options class is configured under that prefix. If you
+    set the documented key on 3.2.0, it silently did nothing and the default
+    (false) applied. The default is the recommended value, so no behavior was
+    lost unless you were deliberately opting IN to rejecting object streams.
+  • README documentation links are now absolute GitHub URLs. Relative markdown
+    paths (KNOWN-GAPS.md, SECURITY-ANALYSIS.md, docs/*, in-page anchors) do not
+    resolve on the NuGet gallery, so every doc link on the package page was dead.
+  • README now documents the 3.1.0 and 3.2.0 releases, which were missing from
+    the packaged copy, and corrects stale FileContent defaults in the sample
+    appsettings block (image dimension caps were still shown as the pre-3.2.0
+    10000 px / 40 MP values).
+
 v3.2.0 — token-aware PDF lexing, real-world false-rejection fixes.
 
 No public API break. FileContentValidatorOptions gains RejectPdfObjectStreams;
@@ -57,7 +83,7 @@ scanner that only existed here — neither side had both.
     instead of its own substring search, and identifies threats by name
     extraction. Object-stream interiors are now inspected with hex-escape
     decoding for the first time.
-  • RejectPdfObjectStreams defaults to FALSE. Object streams are standard in
+  • FileContent:RejectPdfObjectStreams defaults to FALSE. Object streams are standard in
     PDF 1.5+, so rejecting them refused output from Word, Acrobat, browser
     print, and every mainstream phone scanner app. Coverage does not regress
     — their contents are now inflated and name-scanned.

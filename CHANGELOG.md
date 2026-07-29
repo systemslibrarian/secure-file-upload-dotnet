@@ -3,7 +3,50 @@
 All notable changes to `SecureFileUpload.Core` are recorded here. The package
 follows semantic versioning. `AssemblyVersion` is held at `3.0.0.0` across the
 entire `3.0.x` line so patch releases are drop-in upgrades with no
-binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`.
+binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`, and
+`3.2.1` likewise holds at `3.2.0.0` because it changes no IL.
+
+## 3.2.1 — 2026-07-29 — Documentation patch
+
+No code, IL, or on-disk format change. `AssemblyVersion` stays at `3.2.0.0`, so
+this is a drop-in upgrade from `3.2.0`.
+
+### Fixed
+
+- **Corrected config key for the PDF object-stream switch.** The `3.2.0` release
+  notes, this changelog, and the `FileContentValidatorOptions` XML doc all
+  documented it as `FileUpload:ContentValidation:RejectPdfObjectStreams`. The
+  real key is **`FileContent:RejectPdfObjectStreams`** —
+  `AddSecureFileUpload()` binds `FileContentValidatorOptions` to the top-level
+  `"FileContent"` configuration section, so every property on that class is
+  configured under that prefix. Anyone who set the documented key on `3.2.0` had
+  it silently ignored and got the default (`false`). That default is the
+  recommended value, so nothing was weakened — but an operator deliberately
+  opting *in* to rejecting object streams was not getting it.
+- **README documentation links are now absolute GitHub URLs.** The packaged
+  README used relative markdown paths (`KNOWN-GAPS.md`,
+  `SECURITY-ANALYSIS.md`, `SECURITY.md`, `LICENSE`, `docs/*`, `tests/*`) and
+  in-page anchors. The NuGet gallery does not resolve those against the source
+  repository, so every documentation link on the package page was dead.
+- **Stale defaults in the sample `appsettings` block.** The `FileContent`
+  section still showed the pre-`3.2.0` image dimension caps (`10000` px /
+  `40000000` px²) and omitted `RejectPdfObjectStreams`,
+  `MaxDecompressionRatio`, and `MaxPdfStreamScanMilliseconds`. The settings
+  table gained rows for the `FileContent:*` options and for
+  `VirusScan:FailClosedOnUnavailable`, which was described in prose but absent
+  from the table.
+- **Stale upgrade guidance.** The install note still claimed `AssemblyVersion`
+  was pinned at `3.0.0.0`; it has tracked the package version since `3.1.0`.
+  The AV-availability switch was also attributed to `3.0.2` rather than
+  `3.0.3`, and the dependency list said "ASP.NET Core 10+" for a package that
+  multi-targets `net8.0` / `net9.0` / `net10.0`.
+
+### Changed
+
+- **README leads with what the package does**, followed by the eight pipeline
+  layers as an explicit list rather than a bare layer count, and now carries
+  the `3.1.0` and `3.2.0` release notes that were missing from the packaged
+  copy. Older release sections are condensed with a pointer here.
 
 ## 3.2.0 — 2026-07-26 — Token-aware PDF lexing, real-world false-rejection fixes
 
@@ -17,11 +60,13 @@ compressed-stream scanner that only existed here. Neither side had both.
 
 ### Added
 
-- **`FileUpload:ContentValidation:RejectPdfObjectStreams`** (default `false`).
+- **`FileContent:RejectPdfObjectStreams`** (default `false`).
   Object streams (`/ObjStm`) are standard in PDF 1.5+ — Word, Acrobat, browser
   "Print to PDF", and every mainstream phone scanner app emit them — so they
   are accepted and their contents scanned rather than refused. Operators with a
-  controlled producer set can flip this to `true`.
+  controlled producer set can flip this to `true`. (`AddSecureFileUpload()` binds
+  `FileContentValidatorOptions` to the top-level `"FileContent"` section, so every
+  `FileContentValidatorOptions` property is configured under that prefix.)
 - **Compressed-stream contents are now name-scanned.** `ScanCompressedPdfStreams`
   inflates stripped stream payloads and runs the same name-object extraction over
   the decompressed dictionaries, so `/JavaScript` or `/Launch` declared inside an
