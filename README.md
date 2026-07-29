@@ -6,52 +6,91 @@
 [![NuGet downloads](https://img.shields.io/nuget/dt/SecureFileUpload.Core.svg?style=flat-square)](https://www.nuget.org/packages/SecureFileUpload.Core)
 [![Build](https://github.com/systemslibrarian/secure-file-upload-dotnet/actions/workflows/nuget-publish.yml/badge.svg)](https://github.com/systemslibrarian/secure-file-upload-dotnet/actions/workflows/nuget-publish.yml)
 [![Targets: net8.0 / net9.0 / net10.0](https://img.shields.io/badge/targets-net8.0%20%7C%20net9.0%20%7C%20net10.0-512BD4.svg?style=flat-square)](https://dotnet.microsoft.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/LICENSE)
 
-`SecureFileUpload.Core` is lifted from the document-intake workflow of a live public-library patron-registration system, de-branded, hardened, and shipped as a single NuGet package. Eight serial validation layers, encrypted-at-rest storage outside `wwwroot`, and a hardened reference download surface — all behind one `AddSecureFileUpload()` call. Every layer is implemented in code you can read; every limitation is named in [`KNOWN-GAPS.md`](KNOWN-GAPS.md); every security claim traces to a specific line in `src/` per the audit in [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md).
+`SecureFileUpload.Core` gives ASP.NET Core a production-ready, defense-in-depth file-upload pipeline. It **validates, scans, encrypts, and safely stores** uploaded files behind eight serial security layers — attacker-controlled bytes never land in `wwwroot`, never get served back verbatim, and never sit unencrypted on disk. One `AddSecureFileUpload()` call wires the whole thing up.
 
-> This package is **independent of the PostQuantum.\* family.** It is a classical (non-PQC) security library: AES-256-GCM at rest, Argon2id for the master KEK, no post-quantum asymmetric layer. See [`SECURITY.md → Crypto classification`](SECURITY.md) for the explicit posture statement.
+**The eight layers, in pipeline order:**
+
+1. **File size + batch limits** — per-file and per-batch byte caps enforced before buffering
+2. **Extension allowlist** — `.jpg` `.jpeg` `.png` `.webp` `.pdf`; everything else stops here
+3. **MIME ↔ extension cross-validation** — browser-reported `Content-Type` must match the extension
+4. **Magic-number (file signature) validation** — header bytes must match the claimed format
+5. **Filename / path sanitization** — NFKC-normalized; blocks traversal, double extensions, NTFS ADS, Unicode bidi, Windows reserved names
+6. **Deep structural content validation** — JPEG/PNG/WebP/GIF/BMP walkers plus a token-aware PDF scanner that inflates FlateDecode streams, under hard caps for ratio, time, and recursion depth
+7. **Malware scanning** — Windows Defender or ClamAV, pluggable; detection always fail-closed
+8. **AES-256-GCM encrypted storage** — per-file random DEK wrapped under an Argon2id-derived master KEK, randomized filename, outside the web root
+
+Reads go back out through a hardened reference download surface that takes opaque, signed, time-limited tokens instead of storage paths — optionally bound to the issuing user.
+
+The pipeline is lifted from the document-intake workflow of a live public-library patron-registration system, de-branded and hardened for general use. Every layer is implemented in code you can read; every limitation is named in [`KNOWN-GAPS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/KNOWN-GAPS.md); every security claim traces to a specific line in `src/` per the audit in [`SECURITY-ANALYSIS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY-ANALYSIS.md).
+
+> This package is **independent of the PostQuantum.\* family.** It is a classical (non-PQC) security library: AES-256-GCM at rest, Argon2id for the master KEK, no post-quantum asymmetric layer. See [`SECURITY.md → Crypto classification`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY.md) for the explicit posture statement.
 
 > *"So whether you eat or drink or whatever you do, do it all for the glory of God."*
 > — 1 Corinthians 10:31
 
 ---
 
+## What's New in 3.2.1
+
+`3.2.1` is a **documentation patch**. No code, IL, or on-disk format change; `AssemblyVersion` stays at `3.2.0.0`, so it is a drop-in upgrade from `3.2.0`.
+
+- **The PDF object-stream config key was documented wrong in `3.2.0`.** The correct key is **`FileContent:RejectPdfObjectStreams`**, not `FileUpload:ContentValidation:RejectPdfObjectStreams` — `AddSecureFileUpload()` binds `FileContentValidatorOptions` to the top-level `"FileContent"` section, so every property on that class lives under that prefix. If you set the previously-documented key, it was silently ignored and the default (`false`) applied. That default is the recommended value, so nothing was weakened — but an operator deliberately opting *in* to rejecting object streams was not getting it.
+- **Documentation links on the NuGet gallery now work.** The packaged README used relative markdown paths, which the gallery does not resolve against the source repository — every doc link on the package page was dead. All of them are now absolute GitHub URLs.
+- **The packaged README was two releases stale** (its newest section was `3.0.3`) and carried the pre-`3.2.0` image dimension caps in the sample `appsettings` block. Release notes, config sample, and settings table are current; see [`CHANGELOG.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/CHANGELOG.md) for the full list.
+
+## What's New in 3.2.0
+
+`3.2.0` makes the deep content validator **token-aware** and fixes the false rejections that a substring-matching PDF scanner produces on real-world files. No public API break: `FileContentValidatorOptions` gains one property, and three defaults change — all revertible by config.
+
+This release back-ports the validator rework from the production intake application this package was lifted from and merges it with the compressed-stream scanner that only existed here. Neither side had both.
+
+- **PDF tokens are matched by extracting real name objects and decoding `#xx` hex escapes.** `/J#53` no longer slips past the `/JS` check, and `/JSON` no longer trips it. The same lexer now drives the FlateDecode scanner, so `/JavaScript` or `/Launch` declared *inside* a compressed object stream is found by name extraction rather than raw substring — hex-escaped spellings inside object streams are inspected for the first time.
+- **`StripPdfStreamPayloads` treats `stream` as a lexical token.** A plain `IndexOf` matched inside comments, literal strings, and names such as `/upstream`, which discarded the rest of the document and hid every dangerous token that followed. Similarly, `FindPdfToken` no longer treats `(` and `%` as string/comment markers while scanning raw stream bytes — that mis-parse swallowed the real `endstream` and structurally rejected any PDF with an indirect `/Length` (Ghostscript, MFP firmware, PDF/A converters).
+- **`FileContent:RejectPdfObjectStreams` defaults to `false`.** Object streams are standard in PDF 1.5+ — Word, Acrobat, browser "Print to PDF", and every mainstream phone scanner app emit them — so refusing them outright refused ordinary documents. Their contents are now inflated and name-scanned instead, a net **increase** in coverage. Operators with a controlled producer set can flip it to `true`.
+- **Post-EOI JPEG data is scanned but no longer rejected** for failing to match a recognized container. The old allowlist refused MPF second images (Samsung, Sony, Fujifilm), Samsung Motion Photo SEF footers, and alignment padding — the most common trailers in the wild. Detection now comes from scanning those bytes, and JPEG end-of-image is located by walking segments and the entropy-coded scan, which is what makes post-EOI data findable at all.
+- **Image dimension caps raised to 30 000 px / 300 MP** (from 10 000 px / 40 MP). These guard against decompression pixel bombs only; the previous values false-rejected ordinary 48–200 MP smartphone photos.
+- **Image text-threat scans are confined to metadata and comment segments** (JPEG `APPn`/`COM`, PNG `tEXt`/`iTXt`/`zTXt`, WebP `EXIF`/`XMP`, GIF comment/application) instead of running across entropy-coded pixel data, so coincidental byte patterns in photo data no longer false-reject. Regions are delimited so a pattern cannot be synthesized across two unrelated segments. Compressed PNG text chunks (`zTXt`, flagged `iTXt`) are inflated before scanning, under per-chunk and total output bounds. Ambiguous PHP short-open-tag patterns are gone, ending false `JPEG-EmbeddedShell` rejections of legitimate phone photos.
+- **Atomic upload writes.** Files are written to a temporary sibling and moved into place, so an interrupted write never leaves a partial file at the destination; success is logged only after the move. `GetDecryptedFileStreamAsync` now normalizes the path, enforces containment under the storage root, and rejects reparse points in every path component.
+- **`VirusScanOutcome.NotScanned` splits into `Disabled` and `Unavailable`** so "no scanner configured" and "configured scanner failed" are distinguishable in logs. Both remain fail-open and both count toward `ScanNotScannedCount`. Scan counters increment only after storage succeeds, so a file that is scanned and then fails to write is no longer reported as stored.
+- **`SixLabors.ImageSharp` pinned to `[3.1.11,4.0.0)`.** ImageSharp moved to a commercial Six Labors license at v4 — the build fails without a paid license key, and shipping it would push that obligation onto every consumer. The range still admits 3.1.x security patches, which matters because ImageSharp is fed attacker-controlled bytes by design.
+- **Threat scans iterate every occurrence of a pattern** instead of stopping at the first (a short decoy failing the printable-run gate used to abandon the pattern entirely), and cancellation is checked before deep validation for every file type, not only PDFs carrying a compressed stream.
+- **No change** to the 8-layer pipeline order, the on-disk envelope formats, the Argon2id KEK derivation, or the legacy PBKDF2 decrypt fallback.
+
+## What's New in 3.1.0
+
+`3.1.0` closes the sanitization fallback described in `KNOWN-GAPS.md` Gap 1 and adds cryptographic user-binding for download tokens. No public API break — `FileAccessTokenService` gains one optional, DI-resolved constructor parameter, so existing call sites compile unchanged. One deliberate behavioral change, revertible by config.
+
+- **Image recompression now fails closed.** Previously, if the sanitizing re-encode failed, the pipeline logged a warning and stored the *original* validated bytes. But a file whose header parses while its pixel data fails a full decode is exactly the shape of a crafted polyglot, so that fallback silently defeated the mitigation and kept any appended tail on disk. The upload is now rejected with `SECURITY_EVENT | FILE_SAVE_BLOCKED_SANITIZATION`. Set `FileUpload:RejectOnRecompressFailure=false` to restore the old behavior.
+- **Download tokens can be cryptographically bound to the issuing user.** `FileDownload:BindTokensToUser` (default `false`). When enabled, the authenticated identity (`ClaimTypes.NameIdentifier`, falling back to `Identity.Name`) is folded into the Data Protection purpose chain at creation — a token replayed by a *different* account fails cryptographic verification, not merely a policy check. Issuing a token on an unauthenticated request throws, and startup fails fast if the flag is on with no `IHttpContextAccessor`. `AddSecureFileUpload()` now calls `AddHttpContextAccessor()`.
+- **User-facing error strings no longer echo HTML-active characters.** `SanitizeForLog` neutralizes `<`, `>`, `"`, `'` → `?`. Its output is embedded in `FileUploadResult.Errors`; a consumer rendering those without encoding could previously be handed markup from a filename like `<svg onload=…>.jpg`.
+- **Two scanner misconfigurations that silently disabled scanning are fixed.** The Windows Defender timeout now clamps with a 1-second lower bound (matching ClamAV) — a configured `0` previously made every scan time out instantly, silently disabling scanning under the fail-open availability default. ClamAV `MaxStreamBytes` ≤ 0 now falls back to the 25 MiB default with a warning instead of failing every scan.
+- **Supply chain.** GitHub Actions pinned to commit SHAs in both workflows (tag pinning is mutable); Dependabot enabled for the `nuget` and `github-actions` ecosystems so ImageSharp advisories open PRs automatically.
+- **`HardeningV310Tests`** cover the fail-closed and fallback recompression paths, a valid-image round-trip (no over-rejection), HTML-neutralized error output, and the full token-binding matrix: same-user resolve, cross-user replay rejection, anonymous issuance refusal, unbound default round-trip.
+- **No change** to the 8-layer pipeline order, on-disk envelope formats, Argon2id KEK derivation, PBKDF2 legacy decrypt fallback, or the plaintext/DEK zeroing discipline.
+
 ## What's New in 3.0.3
 
-`3.0.3` is a **defense-in-depth hardening patch**. No public API break. `AssemblyVersion` stays at `3.0.0.0` — drop-in upgrade from any `3.0.x`.
+`3.0.3` is a **defense-in-depth hardening patch**. No public API break.
 
 - **Filename validation is NFKC-normalized.** A fullwidth `．．` (U+FF0E ×2) can no longer pretend not to be `..`; fullwidth reserved names (`ＣＯＮ.pdf`) and fullwidth-disguised double-extensions (`evil．exe.pdf`) are caught alongside their literal forms. Trailing dot and trailing space are rejected before Windows path resolution strips them. Hard 255-character length cap. **Legitimate non-ASCII filenames** (accented Latin, CJK, Cyrillic, Greek, etc.) **pass through unchanged** — NFKC is identity on those.
 - **PDF deep validation gains hard caps against decompression bombs and polyglots.** Per-stream **decompression-ratio cap** (default `200×`), per-file **wall-clock timeout** (default `2 000 ms`), bounded **nested-stream recursion depth** (default `2` for `/ObjStm`), and full `CancellationToken` propagation through the FlateDecode walker.
 - **AV availability mode is now configurable.** `VirusScan:FailClosedOnUnavailable` (default `false` = prior fail-open behavior). Set `true` to reject the upload when the scanner cannot give a verdict. Detection mode is **always** fail-closed regardless of this flag. A uniform `VIRUS_SCAN_SKIPPED` security event fires in both modes — operators alert on a single signal.
-- **Crypto classification is now explicit.** At-rest encryption is **classical AES-256-GCM** (quantum-tolerant by key size for confidentiality, but no PQ asymmetric layer). New [`SECURITY.md`](SECURITY.md) states the posture and the deliberate separation from the `PostQuantum.*` family.
-- **`HardeningRegressionTests` adds 25 cases** covering filename evasions and legitimate-Unicode acceptance, decompression-bomb rejection inside the time budget, nested FlateDecode recursion, cancellation propagation, fail-closed AV mode, concurrent encrypted uploads, and `PathHelper.IsPathUnderBase` encoded-separator resistance. Fuzz harness gains a triage assertion that treats any `Allowed` verdict on a curated seed under [`tests/Fuzz/seeds/`](tests/Fuzz/seeds/) as a finding.
+- **Crypto classification is now explicit.** At-rest encryption is **classical AES-256-GCM** (quantum-tolerant by key size for confidentiality, but no PQ asymmetric layer). New [`SECURITY.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY.md) states the posture and the deliberate separation from the `PostQuantum.*` family.
+- **`HardeningRegressionTests` adds 25 cases** covering filename evasions and legitimate-Unicode acceptance, decompression-bomb rejection inside the time budget, nested FlateDecode recursion, cancellation propagation, fail-closed AV mode, concurrent encrypted uploads, and `PathHelper.IsPathUnderBase` encoded-separator resistance. Fuzz harness gains a triage assertion that treats any `Allowed` verdict on a curated seed under [`tests/Fuzz/seeds/`](https://github.com/systemslibrarian/secure-file-upload-dotnet/tree/main/tests/Fuzz/seeds) as a finding.
 - **No change** to the 8-layer pipeline order, the v2 envelope encryption format (`ENCGCM\0\x02`), the Argon2id KEK derivation, the PBKDF2 legacy decrypt fallback, or the plaintext / DEK / KDF-input zeroing discipline. Smoke harness still 18/18 green.
 
-## What's New in 3.0.2
+### Earlier releases
 
-`3.0.2` restores **multi-targeting** for `net8.0`, `net9.0`, and `net10.0`. Dropping to `net10.0`-only in `3.0.0` was a strategic mistake — it forced consumers on currently-supported LTS / STS runtimes to either pin to the `2.x` line or upgrade their host before they could take any of the `3.x` hardening. This release re-publishes the same source as a multi-targeted package.
+Full detail for every release is in [`CHANGELOG.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/CHANGELOG.md).
 
-- **TargetFrameworks: `net8.0;net9.0;net10.0`.** Same source, same crypto posture, same on-disk envelope formats. The entire pipeline already compiled against the .NET 8 BCL; no conditional compilation was needed.
-- **No behavioral or breaking changes from `3.0.1`.** Argon2id KEK derivation, AES-256-GCM v2 envelope, legacy PBKDF2 fallback, opaque download tokens, hardened download controller, and Data Protection deployment guidance are unchanged.
-- **AssemblyVersion stays at `3.0.0.0`** so this is a drop-in upgrade with no binding-redirect change required.
+- **`3.0.2`** — restored multi-targeting for `net8.0` / `net9.0` / `net10.0`. Narrowing to `net10.0`-only in `3.0.0` forced consumers on supported LTS/STS runtimes to pin to `2.x` or upgrade their host before taking any `3.x` hardening. Same source, no conditional compilation — the pipeline already compiled against the .NET 8 BCL.
+- **`3.0.1`** — documentation and code-hygiene patch: multi-instance Data Protection key-persistence guidance, explicit token-replay window documentation.
+- **`3.0.0`** — hardened download surface. **Breaking:** the reference endpoint takes an opaque `fileToken` from `IFileAccessTokenService` instead of a storage-relative `relativePath`; update that integration before upgrading. Release validation became an actual CI gate (solution tests plus runtime smoke harness before pack/publish), and scanner-outage logs were corrected to reflect the real fail-open `NotScanned` behavior.
+- **`2.0.0`** — first stable release of the modernized line, and the origin of the current crypto posture. Argon2id (RFC 9106, OWASP 2024+) replaced PBKDF2-SHA256 for master-KEK derivation with memory-hard defaults `m=64 MiB, t=3, p=4`. Files wrapped under prior PBKDF2 KEKs (600 000 and 210 000 iterations) still decrypt via `FileUpload:KeyDerivation:LegacyKekFallback=true` (default), so no file on disk was bricked; new writes always use the Argon2id KEK. `KeyDerivation:Algorithm = "Pbkdf2"` remains available for FIPS-restricted environments. Deterministic build, Source Link, and `.snupkg` symbols landed here.
 
-## What's New in 3.0.0
-
-`3.0.0` is the hardened download-surface release. **The 8-layer upload pipeline and on-disk crypto formats are unchanged from `2.0.0`.** This release is about the staff-download contract, release validation, and operator-facing correctness.
-
-- **Opaque download tokens replace path-based download links.** The reference controller now accepts `fileToken`, issued by `IFileAccessTokenService`, instead of a storage-relative path. If you linked staff downloads with `relativePath`, update that integration before upgrading.
-- **Release validation is now an actual gate.** The solution tests and the runtime smoke harness both run in CI before pack/publish, so the NuGet package is validated against the same path documented in this repo.
-- **Scanner outage logs now match runtime behavior.** ClamAV and Windows Defender unavailability are logged as `NotScanned` fail-open conditions instead of incorrectly implying fail-closed rejection.
-
-`2.0.0` was the first stable release of the modernized line. The Argon2id KEK and PBKDF2 fallback story from that release still applies:
-
-- **Argon2id for KEK derivation.** The master Key Encryption Key is now derived via Argon2id (RFC 9106, OWASP 2024+ recommendation) with memory-hard defaults — `m=64 MiB, t=3, p=4`. Memory-hardness raises the cost-per-guess on GPUs and ASICs by orders of magnitude over the prior PBKDF2-SHA256 derivation.
-- **Backward-compatible online upgrade.** Files wrapped under prior PBKDF2 KEKs (600 000 and 210 000 iterations) still decrypt via `FileUpload:KeyDerivation:LegacyKekFallback=true` (default). No file on disk is bricked by the upgrade. New writes always use the Argon2id-derived KEK.
-- **Configurable KDF.** Argon2id is the default; `KeyDerivation:Algorithm = "Pbkdf2"` is available for FIPS-restricted environments. All Argon2id parameters and the PBKDF2 iteration count are tunable from `appsettings.json`.
-- **Packaging.** Deterministic build, Source Link, `.snupkg` symbols, and `README.md` / `LICENSE` / `SECURITY-ANALYSIS.md` / `KNOWN-GAPS.md` bundled inside the package itself.
-
-The crypto posture, parameters, and honest residual risks are documented in [Implementation & Crypto Posture](#implementation--crypto-posture) below and in [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md).
+The crypto posture, parameters, and honest residual risks are documented in [Implementation & Crypto Posture](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/README.md#implementation--crypto-posture) below and in [`SECURITY-ANALYSIS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY-ANALYSIS.md).
 
 ---
 
@@ -69,13 +108,13 @@ Most ASP.NET Core upload examples show you how to *receive* a file. This package
 - Disk exhaustion via batched uploads
 - Direct web-serving of attacker-controlled bytes
 
-This package addresses every item on that list in code, then names the gaps it does *not* close. The red-team review in [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) traces each claim to its source line. You do not need to care about cryptography to adopt the upload pipeline — crypto details are in §[Implementation & Crypto Posture](#implementation--crypto-posture) below; the validation pipeline runs identically whether or not you read that section.
+This package addresses every item on that list in code, then names the gaps it does *not* close. The red-team review in [`SECURITY-ANALYSIS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY-ANALYSIS.md) traces each claim to its source line. You do not need to care about cryptography to adopt the upload pipeline — crypto details are in §[Implementation & Crypto Posture](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/README.md#implementation--crypto-posture) below; the validation pipeline runs identically whether or not you read that section.
 
 ---
 
 ## The 8-layer pipeline
 
-Every uploaded file passes through eight serial layers. **Failure at any content-decision layer rejects the file.** The pipeline is fail-closed on content; the single fail-open seam is virus-scanner *availability* (Layer 7), and that is documented, counted, and never silently relabelled as clean — see [`KNOWN-GAPS.md §Gap 9`](KNOWN-GAPS.md).
+Every uploaded file passes through eight serial layers. **Failure at any content-decision layer rejects the file.** The pipeline is fail-closed on content; the single fail-open seam is virus-scanner *availability* (Layer 7), and that is documented, counted, and never silently relabelled as clean — see [`KNOWN-GAPS.md §Gap 9`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/KNOWN-GAPS.md).
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -131,7 +170,7 @@ Every uploaded file passes through eight serial layers. **Failure at any content
 
 ### What each layer actually does
 
-For an ASP.NET developer adopting this pipeline without any cryptography interest, here is the one-paragraph "what does this defend against" view of each layer. Crypto details remain in §[Implementation & Crypto Posture](#implementation--crypto-posture) below — the pipeline runs identically whether or not you read that section.
+For an ASP.NET developer adopting this pipeline without any cryptography interest, here is the one-paragraph "what does this defend against" view of each layer. Crypto details remain in §[Implementation & Crypto Posture](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/README.md#implementation--crypto-posture) below — the pipeline runs identically whether or not you read that section.
 
 | Layer | Defends against | One-line summary |
 |---|---|---|
@@ -146,9 +185,9 @@ For an ASP.NET developer adopting this pipeline without any cryptography interes
 
 ### AV failure mode: fail-open vs. fail-closed (explicit operator choice)
 
-When the virus scanner is **unreachable** (clamd down, `MpCmdRun.exe` missing, timeout, parser error, exception), the pipeline must pick one of two behaviors. As of `3.0.2` this is an explicit configuration option:
+When the virus scanner is **unreachable** (clamd down, `MpCmdRun.exe` missing, timeout, parser error, exception), the pipeline must pick one of two behaviors. As of `3.0.3` this is an explicit configuration option:
 
-- **Fail-open on availability** — `VirusScan:FailClosedOnUnavailable=false` *(default; matches prior behavior)*. The file is accepted and recorded as `NotScanned`, counted in `FileUploadResult.ScanNotScannedCount`, and a single `VIRUS_SCAN_SKIPPED` security event is emitted with `Reason=ScannerUnavailable` so operators can alert on a non-zero count per window. This is the trade-off the original library deployment made: a Defender hiccup must not block patrons from registering for a library card.
+- **Fail-open on availability** — `VirusScan:FailClosedOnUnavailable=false` *(default; matches prior behavior)*. The file is accepted and recorded as `Unavailable` (or `Disabled` when no scanner is configured — the two were a single `NotScanned` outcome before `3.2.0`), counted in `FileUploadResult.ScanNotScannedCount`, and a single `VIRUS_SCAN_SKIPPED` security event is emitted with `Reason=ScannerUnavailable` so operators can alert on a non-zero count per window. This is the trade-off the original library deployment made: a Defender hiccup must not block patrons from registering for a library card.
 - **Fail-closed on availability** — `VirusScan:FailClosedOnUnavailable=true`. Scanner unavailability **rejects** the upload with a clear `scanner unavailable` workflow error. The same `VIRUS_SCAN_SKIPPED` metric is still emitted so operations can alert identically in either mode.
 
 **Detection** (an `Infected` verdict from a reachable scanner) is **always fail-closed**, regardless of this setting. The knob only controls what happens when the scanner cannot give a verdict at all. Pick the mode that matches your environment's risk tolerance; do not pick by default.
@@ -171,7 +210,7 @@ Pick the TFM that matches your host:
 | .NET 9 (STS, in support)  | `net9.0` build      | Same source. |
 | .NET 10 (LTS, current)    | `net10.0` build     | Same source. |
 
-> If you're upgrading from any prior `3.0.x` (`3.0.0` / `3.0.1` / `3.0.2`), this is a drop-in change — `AssemblyVersion` is unchanged at `3.0.0.0` and the on-disk envelope formats (`ENCGCM\0\x01` / `ENCGCM\0\x02`) are byte-for-byte compatible. No re-wrap, no migration. The new `VirusScan:FailClosedOnUnavailable` knob defaults to `false`, which preserves the prior fail-open behavior — opt in to fail-closed availability only if your environment requires it.
+> **Upgrading from any `3.x`?** No public API break anywhere in the line, and the on-disk envelope formats (`ENCGCM\0\x01` / `ENCGCM\0\x02`) are byte-for-byte compatible throughout — no re-wrap, no migration. `AssemblyVersion` tracks the package version from `3.1.0` onward (it was held at `3.0.0.0` across the `3.0.x` patches), so coming from `3.0.x` on a framework that uses binding redirects, refresh them. Two behavioral changes are worth knowing about, both revertible by config: image recompression fails closed as of `3.1.0` (`FileUpload:RejectOnRecompressFailure`, default `true`), and `3.2.0` accepts PDF object streams and larger image dimensions rather than rejecting them (`RejectPdfObjectStreams`, `MaxImageWidth`/`Height`/`Pixels`). If you are coming from `2.x`, the `3.0.0` download-endpoint change is breaking — see *Earlier releases* above.
 
 ---
 
@@ -271,7 +310,7 @@ public sealed class StaffFilesController : Controller
 
 The token is opaque, signed, and short-lived by default. Staff-facing URLs never need to expose a storage-relative path. If your application has both public and staff-only controllers, scope the `RequireAuthorization("StaffFiles")` call to the staff route set instead of every controller endpoint in the app.
 
-A complete `appsettings.json` reference is in [Configuration](#configuration) below.
+A complete `appsettings.json` reference is in [Configuration](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/README.md#configuration) below.
 
 ---
 
@@ -324,7 +363,7 @@ This section names primitives, parameters, and residual risks. It is the single 
 
 | Aspect | Implementation | Notes |
 |---|---|---|
-| Crypto classification | **Classical, not post-quantum.** AES-256-GCM provides quantum-resistant *confidentiality* by key size (Grover's algorithm halves the effective key size to 128 bits, which remains comfortable). There is **no PQ asymmetric layer** — no ML-KEM, no ML-DSA, no asymmetric primitives at all. | This package is intentionally separate from the `PostQuantum.*` family. No PQC migration path is planned for v3.x. See [`SECURITY.md`](SECURITY.md) for the explicit posture. |
+| Crypto classification | **Classical, not post-quantum.** AES-256-GCM provides quantum-resistant *confidentiality* by key size (Grover's algorithm halves the effective key size to 128 bits, which remains comfortable). There is **no PQ asymmetric layer** — no ML-KEM, no ML-DSA, no asymmetric primitives at all. | This package is intentionally separate from the `PostQuantum.*` family. No PQC migration path is planned for v3.x. See [`SECURITY.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY.md) for the explicit posture. |
 | Symmetric encryption | **AES-256-GCM** via `System.Security.Cryptography.AesGcm` | 96-bit nonce, 128-bit auth tag — NIST SP 800-38D / RFC 5288. |
 | Encryption scheme | **Envelope (v2)** — per-file random 256-bit DEK wrapped under a master KEK | KEK rotation rewraps DEKs without re-encrypting file payloads. |
 | KEK derivation (writes) | **Argon2id** via `Konscious.Security.Cryptography.Argon2` 1.3.x | RFC 9106; OWASP 2024+ recommendation. Memory-hard. |
@@ -343,10 +382,10 @@ This section names primitives, parameters, and residual risks. It is the single 
 - **The KDF salt is in source.** It is identical across deployments of this library version. The protection model assumes the *secret* lives in a real secrets manager (Key Vault, AWS Secrets Manager, env var injected by the platform) — never `appsettings.json` committed to a repo.
 - **Argon2id is not FIPS-validated.** Compliance-bound deployments must select `Pbkdf2` explicitly.
 - **The KEK lives in process memory.** A memory-disclosure or core-dump capability on the host bypasses the KDF entirely. Mitigations are deployment-level (least privilege, ASLR, sealed VMs, confidential compute).
-- **No HSM / KMS integration in v1.** A KMS-backed KEK is tracked in [`docs/hardening-roadmap.md`](docs/hardening-roadmap.md) as the right next step for high-assurance deployments.
+- **No HSM / KMS integration in v1.** A KMS-backed KEK is tracked in [`docs/hardening-roadmap.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/docs/hardening-roadmap.md) as the right next step for high-assurance deployments.
 - **Argon2id parameters are CPU/RAM-bound.** On a constrained container, startup derivation may take longer than the ~250–500 ms target. The library logs `KDF_ARGON2ID_DERIVED | ElapsedMs=...` so this is measurable.
 
-For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md). For things this pipeline does *not* protect against, see [`KNOWN-GAPS.md`](KNOWN-GAPS.md).
+For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY-ANALYSIS.md). For things this pipeline does *not* protect against, see [`KNOWN-GAPS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/KNOWN-GAPS.md).
 
 ---
 
@@ -384,11 +423,14 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](SECURITY-
     "InspectCompressedPdfStreams": true,
     "MaxCompressedStreamsToInspect": 64,
     "MaxDecompressedStreamBytes": 16777216,
+    "MaxDecompressionRatio": 200,
+    "MaxPdfStreamScanMilliseconds": 2000,
     "RejectEncryptedPdfs": true,
     "RejectInteractivePdfs": false,
-    "MaxImageWidth": 10000,
-    "MaxImageHeight": 10000,
-    "MaxImagePixels": 40000000
+    "RejectPdfObjectStreams": false,
+    "MaxImageWidth": 30000,
+    "MaxImageHeight": 30000,
+    "MaxImagePixels": 300000000
   },
   "FileDownload": {
     "TokenLifetimeMinutes": 15,
@@ -422,7 +464,13 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](SECURITY-
 | `FileUpload:RejectOnRecompressFailure` | `true` (default, 3.1.0) rejects the upload when the sanitizing re-encode fails — a header that parses but a decode that fails is the shape of a crafted polyglot. Set `false` to restore the pre-3.1.0 store-original-bytes fallback. |
 | `FileDownload:TokenLifetimeMinutes` | Lifetime for opaque download tokens issued by `IFileAccessTokenService`. Default 15 minutes; max 24 hours. |
 | `FileDownload:BindTokensToUser` | `false` (default). When `true`, download tokens are cryptographically bound to the issuing authenticated user; replay from any other account fails verification. |
+| `FileContent:RejectPdfObjectStreams` | `false` (default, 3.2.0). Object streams are standard in PDF 1.5+, so they are accepted and their inflated contents name-scanned. Set `true` only with a controlled PDF producer set — expect false rejections of ordinary phone-scanner and Office output. |
+| `FileContent:InspectCompressedPdfStreams` | `true` (default). Inflates FlateDecode stream payloads and re-runs name extraction plus the pattern scan. This is what makes `RejectPdfObjectStreams=false` safe. |
+| `FileContent:MaxDecompressionRatio` / `MaxPdfStreamScanMilliseconds` | Decompression-bomb guards: per-stream inflate ratio (default `200×`) and per-file wall-clock budget for the stream scan (default `2000` ms). |
+| `FileContent:MaxImageWidth` / `MaxImageHeight` / `MaxImagePixels` | Pixel-bomb guards only (defaults `30000` / `30000` / `300000000`, raised in 3.2.0). `FileUpload:MaxFileSizeBytes` remains the primary size guard. |
+| `FileContent:RejectEncryptedPdfs` / `RejectInteractivePdfs` | Reject `/Encrypt` PDFs (`true` by default — their contents cannot be scanned) and `/AcroForm` PDFs (`false` by default). |
 | `VirusScan:Enabled` | When `false`, Layer 7 is bypassed. Layers 1–6 + 8 still run. |
+| `VirusScan:FailClosedOnUnavailable` | `false` (default) accepts the file as `Unavailable`/`NotScanned` when the scanner cannot give a verdict; `true` rejects it. Detection is always fail-closed regardless. |
 | `VirusScan:ClamAv:MaxStreamBytes` | Must align with `StreamMaxLength` in your `clamd.conf`. |
 
 ---
@@ -431,7 +479,7 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](SECURITY-
 
 Declared by the NuGet package — no manual installation required:
 
-- **ASP.NET Core 10+** shared framework (via `FrameworkReference`)
+- **ASP.NET Core 8, 9, or 10** shared framework (via `FrameworkReference`)
 - **[SixLabors.ImageSharp 3.1.x](https://github.com/SixLabors/ImageSharp)** — image identification and polyglot-tail recompression
 - **[Konscious.Security.Cryptography.Argon2 1.3.x](https://github.com/kmaragon/Konscious.Security.Cryptography)** — Argon2id KEK derivation
 
@@ -463,12 +511,12 @@ The scanner is selected automatically by `AddSecureFileUpload()` based on `Opera
 
 ## Docs
 
-- [`SECURITY-ANALYSIS.md`](SECURITY-ANALYSIS.md) — full code-traced security review, with each claim pointing at source lines
-- [`KNOWN-GAPS.md`](KNOWN-GAPS.md) — honest limitations and what this does NOT protect against
-- [`docs/threat-model.md`](docs/threat-model.md) — what attack each layer defeats
-- [`docs/hardening-roadmap.md`](docs/hardening-roadmap.md) — recommended next steps toward the strongest realistic posture
-- [`tests/attack-vectors.md`](tests/attack-vectors.md) — per-layer attack test cases
-- [`tests/Fuzz/`](tests/Fuzz/) — SharpFuzz + AFL++ harness for the deep content validator
+- [`SECURITY-ANALYSIS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY-ANALYSIS.md) — full code-traced security review, with each claim pointing at source lines
+- [`KNOWN-GAPS.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/KNOWN-GAPS.md) — honest limitations and what this does NOT protect against
+- [`docs/threat-model.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/docs/threat-model.md) — what attack each layer defeats
+- [`docs/hardening-roadmap.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/docs/hardening-roadmap.md) — recommended next steps toward the strongest realistic posture
+- [`tests/attack-vectors.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/tests/attack-vectors.md) — per-layer attack test cases
+- [`tests/Fuzz/`](https://github.com/systemslibrarian/secure-file-upload-dotnet/tree/main/tests/Fuzz) — SharpFuzz + AFL++ harness for the deep content validator
 
 ---
 
@@ -504,7 +552,7 @@ If you're filing a security report, please open a private advisory on GitHub rat
 
 ## License
 
-[MIT](LICENSE). Use freely. Attribution appreciated, not required.
+[MIT](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/LICENSE). Use freely. Attribution appreciated, not required.
 
 ---
 
