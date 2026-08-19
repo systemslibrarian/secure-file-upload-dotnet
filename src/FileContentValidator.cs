@@ -146,6 +146,114 @@ namespace SecureFileUpload.Services
         RejectedTypeMismatch
     }
 
+
+    /// <summary>
+    /// Closed set of user-safe rejection messages. <see cref="ContentValidationResult.ErrorMessage"/>
+    /// is resolved only from this enum, never from the validator's internal reason string.
+    /// </summary>
+    /// <remarks>
+    /// The internal reason names the exact gate that fired ("Missing %%EOF trailer",
+    /// "Embedded ZIP detected at offset N"). Surfacing it to whoever uploaded the file turns
+    /// every rejection into a labeled oracle: an attacker can probe it to learn which check
+    /// blocked a payload and tune the next attempt around it. The reason still reaches the
+    /// security log and <see cref="ContentValidationResult.ThreatDescription"/>; only the
+    /// user-facing string is curated. Gates with no actionable advice deliberately collapse
+    /// to one shared generic, so two distinct rejections are indistinguishable from outside.
+    /// </remarks>
+    public enum UploadRejectionMessageKey
+    {
+        /// <summary>
+        /// Shared, format-neutral generic. This is the DEFAULT for every structural and
+        /// policy rejection, so a gate that is not explicitly annotated can never leak its
+        /// own text.
+        /// </summary>
+        FileRejectedGeneric = 0,
+
+        /// <summary>A PDF was blocked by a dangerous-pattern rule.</summary>
+        PdfSecurityUploadImageInstead,
+
+        /// <summary>
+        /// A PDF was rejected by a structural or policy gate (malformed, unreadable object
+        /// stream, interactive form, and so on). Every such gate resolves to this ONE string,
+        /// so the caller cannot tell which check fired.
+        /// </summary>
+        PdfUnreadableUploadImage,
+
+        /// <summary>A PDF is password-protected, which the uploader can actually fix.</summary>
+        PdfEncryptedRemovePassword,
+
+        /// <summary>An image is too large to process safely.</summary>
+        ImageTooLargeUploadSmaller,
+
+        /// <summary>An image could not be read or decoded.</summary>
+        ImageUnreadableRetake,
+
+        /// <summary>An image was rejected with no more specific guidance available.</summary>
+        ImageRejectedGeneric
+    }
+
+    /// <summary>
+    /// Resolves an <see cref="UploadRejectionMessageKey"/> to its fixed, user-safe string.
+    /// Every value is a compile-time constant; none is derived from file content, so no
+    /// message can echo attacker-supplied bytes back to the uploader.
+    /// </summary>
+    /// <remarks>
+    /// The wording is deliberately generic so it suits any consumer of this package. Callers
+    /// that want their own phrasing should map <see cref="ContentValidationResult.Disposition"/>
+    /// and this key to their own strings rather than reusing
+    /// <see cref="ContentValidationResult.ThreatDescription"/>, which carries detection detail
+    /// and is not safe to display.
+    /// </remarks>
+    public static class UploadRejectionMessages
+    {
+        /// <summary>Shared generic. Names no gate, so distinct reasons collapse to one string.</summary>
+        public const string FileRejectedGeneric =
+            "We could not accept this file. Please upload a clear image (JPG, PNG, or WebP) " +
+            "or a standard PDF, and try again.";
+
+        /// <summary>PDF blocked by a dangerous-pattern rule. Reveals no detection detail.</summary>
+        public const string PdfSecurityUploadImageInstead =
+            "This PDF was rejected for security reasons. Please upload an image (JPG or PNG) " +
+            "instead of a PDF and try again.";
+
+        /// <summary>Every structural or policy PDF gate resolves here. Detail stays in the log.</summary>
+        public const string PdfUnreadableUploadImage =
+            "We could not process this PDF. Please upload an image (JPG or PNG) of the " +
+            "document instead of a PDF, and try again.";
+
+        /// <summary>Password-protected PDF, an actionable case.</summary>
+        public const string PdfEncryptedRemovePassword =
+            "This PDF is password-protected, so we cannot open it. Please remove the password " +
+            "and upload it again, or upload an image (JPG or PNG) instead.";
+
+        /// <summary>Size rejections. No dimensions or pixel counts appear here.</summary>
+        public const string ImageTooLargeUploadSmaller =
+            "This image is too large for us to process. Please upload a smaller or " +
+            "lower-resolution image and try again.";
+
+        /// <summary>Decode failures. Never includes the exception type or file name.</summary>
+        public const string ImageUnreadableRetake =
+            "We could not read this image. Please re-capture or re-export it and upload it " +
+            "again, making sure the file finishes uploading.";
+
+        /// <summary>Curated fallback for image gates with no more specific guidance.</summary>
+        public const string ImageRejectedGeneric =
+            "We could not accept this image. Please upload a clear image (JPG, PNG, or WebP) " +
+            "and try again.";
+
+        /// <summary>Maps a key to its fixed string. Unknown values fall back to the generic.</summary>
+        public static string Resolve(UploadRejectionMessageKey key) => key switch
+        {
+            UploadRejectionMessageKey.PdfSecurityUploadImageInstead => PdfSecurityUploadImageInstead,
+            UploadRejectionMessageKey.PdfUnreadableUploadImage => PdfUnreadableUploadImage,
+            UploadRejectionMessageKey.PdfEncryptedRemovePassword => PdfEncryptedRemovePassword,
+            UploadRejectionMessageKey.ImageTooLargeUploadSmaller => ImageTooLargeUploadSmaller,
+            UploadRejectionMessageKey.ImageUnreadableRetake => ImageUnreadableRetake,
+            UploadRejectionMessageKey.ImageRejectedGeneric => ImageRejectedGeneric,
+            _ => FileRejectedGeneric
+        };
+    }
+
     /// <summary>
     /// Signature-first file type classifier.
     /// Infers the actual format from magic bytes before any extension-based dispatch.
@@ -1058,20 +1166,20 @@ namespace SecureFileUpload.Services
             byte[] bytes, string fileName, CancellationToken cancellationToken)
         {
             if (bytes.Length < 8)
-                return RejectStructural(fileName, "PDF", "File too small to be a valid PDF.", "PDF-StructuralCheck");
+                return RejectStructural(fileName, "PDF", "File too small to be a valid PDF.", "PDF-StructuralCheck", UploadRejectionMessageKey.PdfUnreadableUploadImage);
 
             if (!AsciiEquals(bytes, 0, "%PDF-"))
-                return RejectStructural(fileName, "PDF", "Invalid or missing PDF header.", "PDF-StructuralCheck");
+                return RejectStructural(fileName, "PDF", "Invalid or missing PDF header.", "PDF-StructuralCheck", UploadRejectionMessageKey.PdfUnreadableUploadImage);
 
             if (!char.IsDigit((char)bytes[5]))
-                return RejectStructural(fileName, "PDF", "Malformed PDF version header.", "PDF-StructuralCheck");
+                return RejectStructural(fileName, "PDF", "Malformed PDF version header.", "PDF-StructuralCheck", UploadRejectionMessageKey.PdfUnreadableUploadImage);
 
             // Single decode — reused for all pattern checks below.
             string content = Encoding.Latin1.GetString(bytes);
 
             int eofIndex = content.LastIndexOf("%%EOF", StringComparison.Ordinal);
             if (eofIndex < 0)
-                return RejectStructural(fileName, "PDF", "Missing %%EOF trailer.", "PDF-StructuralCheck");
+                return RejectStructural(fileName, "PDF", "Missing %%EOF trailer.", "PDF-StructuralCheck", UploadRejectionMessageKey.PdfUnreadableUploadImage);
 
             // Whitespace-aware trailing check — rejects appended payloads while
             // allowing legitimately padded PDFs.
@@ -1114,7 +1222,7 @@ namespace SecureFileUpload.Services
                 return RejectStructural(
                     fileName, "PDF",
                     "Malformed PDF: unbalanced stream/endstream structure.",
-                    "PDF-MalformedStream");
+                    "PDF-MalformedStream", UploadRejectionMessageKey.PdfUnreadableUploadImage);
             }
 
             if (!TryExtractPdfNames(dictContent, out HashSet<string> pdfNames))
@@ -1122,14 +1230,14 @@ namespace SecureFileUpload.Services
                 return RejectStructural(
                     fileName, "PDF",
                     "Malformed hexadecimal escape in PDF name object.",
-                    "PDF-MalformedName");
+                    "PDF-MalformedName", UploadRejectionMessageKey.PdfUnreadableUploadImage);
             }
 
             if (_options.RejectEncryptedPdfs && pdfNames.Contains("Encrypt"))
                 return RejectPolicy(
                     fileName, "PDF",
                     "Encrypted PDFs are not permitted by security policy.",
-                    "PDF-EncryptedRejected");
+                    "PDF-EncryptedRejected", UploadRejectionMessageKey.PdfEncryptedRemovePassword);
 
             // Object streams hide dictionaries inside compressed stream payloads. Modern PDF
             // producers (PDF 1.5+) emit them routinely, so they are accepted by default and
@@ -1142,7 +1250,7 @@ namespace SecureFileUpload.Services
                     return RejectPolicy(
                         fileName, "PDF",
                         "PDF object streams are not permitted by security policy.",
-                        "PDF-ObjectStreamRejected");
+                        "PDF-ObjectStreamRejected", UploadRejectionMessageKey.PdfUnreadableUploadImage);
 
                 if (_options.InspectCompressedPdfStreams)
                     _logger.LogDebug(
@@ -1196,7 +1304,7 @@ namespace SecureFileUpload.Services
                     return RejectPolicy(
                         fileName, "PDF",
                         "Interactive form PDFs are not permitted by policy.",
-                        "PDF-InteractiveRejected");
+                        "PDF-InteractiveRejected", UploadRejectionMessageKey.PdfUnreadableUploadImage);
             }
 
             if (ContainsNullByteSequence(bytes, 10))
@@ -1325,7 +1433,7 @@ namespace SecureFileUpload.Services
                     return RejectStructural(
                         fileName, "PDF",
                         "PDF compressed-stream scan exceeded the configured time budget.",
-                        "PDF-CompressedStreamTimeout");
+                        "PDF-CompressedStreamTimeout", UploadRejectionMessageKey.PdfUnreadableUploadImage);
                 }
 
                 // Offsets come from a Latin1 decode of these same bytes, so they map 1:1.
@@ -1485,7 +1593,7 @@ namespace SecureFileUpload.Services
                     return RejectPolicy(
                         fileName, "PDF",
                         "Interactive form PDFs are not permitted by policy.",
-                        "PDF-InteractiveRejected");
+                        "PDF-InteractiveRejected", UploadRejectionMessageKey.PdfUnreadableUploadImage);
             }
 
             return null;
@@ -1500,12 +1608,12 @@ namespace SecureFileUpload.Services
         private ContentValidationResult ValidateJpeg(byte[] bytes, string fileName)
         {
             if (bytes.Length < 4)
-                return RejectStructural(fileName, "JPEG", "File too small to be a valid JPEG.", "JPEG-StructuralCheck");
+                return RejectStructural(fileName, "JPEG", "File too small to be a valid JPEG.", "JPEG-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (ValidateImageMetadata(bytes, fileName, "JPEG") is { } metaFail) return metaFail;
 
             if (bytes[0] != 0xFF || bytes[1] != 0xD8 || bytes[2] != 0xFF || !ValidJpegMarkerTypes.Contains(bytes[3]))
-                return RejectStructural(fileName, "JPEG", "Invalid JPEG SOI or marker type.", "JPEG-StructuralCheck");
+                return RejectStructural(fileName, "JPEG", "Invalid JPEG SOI or marker type.", "JPEG-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             // Locate the TRUE end of image by walking segments and the entropy-coded scan
             // (see FindJpegEndOfImage). Any bytes after that point are NOT part of the
@@ -1513,12 +1621,12 @@ namespace SecureFileUpload.Services
             // examined at all, which let an appended shell pass validation.
             int endOfImage = FindJpegEndOfImage(bytes);
             if (endOfImage < 0)
-                return RejectStructural(fileName, "JPEG", "Missing or invalid JPEG EOI marker.", "JPEG-StructuralCheck");
+                return RejectStructural(fileName, "JPEG", "Missing or invalid JPEG EOI marker.", "JPEG-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             // Walk JPEG segments: validate marker types and declared segment lengths.
             // Stops at SOS (0xDA) since entropy-coded data follows and cannot be walked.
             if (!ValidateJpegSegmentLayout(bytes))
-                return RejectStructural(fileName, "JPEG", "Invalid JPEG segment structure.", "JPEG-SegmentWalk");
+                return RejectStructural(fileName, "JPEG", "Invalid JPEG segment structure.", "JPEG-SegmentWalk", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (RunImageThreatScans(bytes, fileName, "JPEG") is { } threatResult)
                 return threatResult;
@@ -1539,18 +1647,18 @@ namespace SecureFileUpload.Services
         private ContentValidationResult ValidatePng(byte[] bytes, string fileName)
         {
             if (bytes.Length < 33)
-                return RejectStructural(fileName, "PNG", "File too small to be a valid PNG.", "PNG-StructuralCheck");
+                return RejectStructural(fileName, "PNG", "File too small to be a valid PNG.", "PNG-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (ValidateImageMetadata(bytes, fileName, "PNG") is { } metaFail) return metaFail;
 
             if (!SignaturesMatch(bytes, PngSignature))
-                return RejectStructural(fileName, "PNG", "Invalid PNG signature.", "PNG-StructuralCheck");
+                return RejectStructural(fileName, "PNG", "Invalid PNG signature.", "PNG-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (!AsciiEquals(bytes, 12, "IHDR"))
-                return RejectStructural(fileName, "PNG", "Missing IHDR chunk.", "PNG-StructuralCheck");
+                return RejectStructural(fileName, "PNG", "Missing IHDR chunk.", "PNG-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (!ValidatePngChunkLayout(bytes))
-                return RejectStructural(fileName, "PNG", "Invalid PNG chunk layout or missing IEND.", "PNG-StructuralCheck");
+                return RejectStructural(fileName, "PNG", "Invalid PNG chunk layout or missing IEND.", "PNG-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (RunImageThreatScans(bytes, fileName, "PNG") is { } threatResult)
                 return threatResult;
@@ -1562,12 +1670,12 @@ namespace SecureFileUpload.Services
         private ContentValidationResult ValidateWebp(byte[] bytes, string fileName)
         {
             if (bytes.Length < 12)
-                return RejectStructural(fileName, "WEBP", "File too small to be a valid WebP.", "WEBP-StructuralCheck");
+                return RejectStructural(fileName, "WEBP", "File too small to be a valid WebP.", "WEBP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (ValidateImageMetadata(bytes, fileName, "WEBP") is { } metaFail) return metaFail;
 
             if (!AsciiEquals(bytes, 0, "RIFF") || !AsciiEquals(bytes, 8, "WEBP"))
-                return RejectStructural(fileName, "WEBP", "Invalid WebP RIFF/WEBP header.", "WEBP-StructuralCheck");
+                return RejectStructural(fileName, "WEBP", "Invalid WebP RIFF/WEBP header.", "WEBP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             // Strict equality: declared payload + 8-byte RIFF header must equal actual file length.
             // Intentionally stricter than the RIFF spec to reject files with appended payloads
@@ -1575,10 +1683,10 @@ namespace SecureFileUpload.Services
             uint  declaredRiffPayloadSize = BitConverter.ToUInt32(bytes, 4);
             ulong expectedContainerSize   = declaredRiffPayloadSize + 8UL;
             if ((ulong)bytes.Length != expectedContainerSize)
-                return RejectStructural(fileName, "WEBP", "WebP file size is inconsistent with RIFF header.", "WEBP-StructuralCheck");
+                return RejectStructural(fileName, "WEBP", "WebP file size is inconsistent with RIFF header.", "WEBP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (!ValidateWebpChunkLayout(bytes))
-                return RejectStructural(fileName, "WEBP", "Invalid WebP chunk layout.", "WEBP-StructuralCheck");
+                return RejectStructural(fileName, "WEBP", "Invalid WebP chunk layout.", "WEBP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (RunImageThreatScans(bytes, fileName, "WEBP") is { } threatResult)
                 return threatResult;
@@ -1590,26 +1698,26 @@ namespace SecureFileUpload.Services
         private ContentValidationResult ValidateGif(byte[] bytes, string fileName)
         {
             if (bytes.Length < 13)
-                return RejectStructural(fileName, "GIF", "File too small to be a valid GIF.", "GIF-StructuralCheck");
+                return RejectStructural(fileName, "GIF", "File too small to be a valid GIF.", "GIF-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (ValidateImageMetadata(bytes, fileName, "GIF") is { } metaFail) return metaFail;
 
             if (!AsciiEquals(bytes, 0, "GIF87a") && !AsciiEquals(bytes, 0, "GIF89a"))
-                return RejectStructural(fileName, "GIF", "Invalid GIF header.", "GIF-StructuralCheck");
+                return RejectStructural(fileName, "GIF", "Invalid GIF header.", "GIF-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             ushort width  = BitConverter.ToUInt16(bytes, 6);
             ushort height = BitConverter.ToUInt16(bytes, 8);
             if (width == 0 || height == 0)
-                return RejectStructural(fileName, "GIF", "GIF has zero width or height.", "GIF-StructuralCheck");
+                return RejectStructural(fileName, "GIF", "GIF has zero width or height.", "GIF-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             // Verify GIF trailer byte (0x3B).
             if (bytes[^1] != 0x3B)
-                return RejectStructural(fileName, "GIF", "Missing GIF trailer byte.", "GIF-StructuralCheck");
+                return RejectStructural(fileName, "GIF", "Missing GIF trailer byte.", "GIF-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             // Walk GIF block structure: logical screen descriptor, global color table,
             // image descriptors, extensions, and sub-block chains.
             if (!ValidateGifBlockLayout(bytes))
-                return RejectStructural(fileName, "GIF", "Invalid GIF block structure.", "GIF-BlockWalk");
+                return RejectStructural(fileName, "GIF", "Invalid GIF block structure.", "GIF-BlockWalk", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (RunImageThreatScans(bytes, fileName, "GIF") is { } threatResult)
                 return threatResult;
@@ -1621,45 +1729,45 @@ namespace SecureFileUpload.Services
         private ContentValidationResult ValidateBmp(byte[] bytes, string fileName)
         {
             if (bytes.Length < 30)
-                return RejectStructural(fileName, "BMP", "File too small to be a valid BMP.", "BMP-StructuralCheck");
+                return RejectStructural(fileName, "BMP", "File too small to be a valid BMP.", "BMP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (ValidateImageMetadata(bytes, fileName, "BMP") is { } metaFail) return metaFail;
 
             if (bytes[0] != 0x42 || bytes[1] != 0x4D)
-                return RejectStructural(fileName, "BMP", "Invalid BMP header.", "BMP-StructuralCheck");
+                return RejectStructural(fileName, "BMP", "Invalid BMP header.", "BMP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             // BMP spec allows the file-size field to be 0 for BI_RGB bitmaps.
             // Many legitimate editors (GIMP, older Paint versions) produce these.
             // Only reject when the field is non-zero AND inconsistent with actual size.
             uint declaredSize = BitConverter.ToUInt32(bytes, 2);
             if (declaredSize != 0 && declaredSize > bytes.Length)
-                return RejectStructural(fileName, "BMP", "BMP file size is inconsistent with header.", "BMP-StructuralCheck");
+                return RejectStructural(fileName, "BMP", "BMP file size is inconsistent with header.", "BMP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             uint pixelDataOffset = BitConverter.ToUInt32(bytes, 10);
             if (pixelDataOffset < 14 || pixelDataOffset >= bytes.Length)
-                return RejectStructural(fileName, "BMP", "Invalid BMP pixel data offset.", "BMP-StructuralCheck");
+                return RejectStructural(fileName, "BMP", "Invalid BMP pixel data offset.", "BMP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             uint dibHeaderSize = BitConverter.ToUInt32(bytes, 14);
             if (!ValidBmpDibSizes.Contains(dibHeaderSize))
-                return RejectStructural(fileName, "BMP", $"Invalid BMP DIB header size ({dibHeaderSize}).", "BMP-StructuralCheck");
+                return RejectStructural(fileName, "BMP", $"Invalid BMP DIB header size ({dibHeaderSize}).", "BMP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             // Extended BMP structural checks (BITMAPINFOHEADER and later, dibHeaderSize >= 40).
             if (dibHeaderSize >= 40 && bytes.Length >= 30)
             {
                 ushort planes = BitConverter.ToUInt16(bytes, 26);
                 if (planes != 1)
-                    return RejectStructural(fileName, "BMP", $"Invalid BMP planes value ({planes}); must be 1.", "BMP-StructuralCheck");
+                    return RejectStructural(fileName, "BMP", $"Invalid BMP planes value ({planes}); must be 1.", "BMP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
                 ushort bitsPerPixel = BitConverter.ToUInt16(bytes, 28);
                 if (!ValidBmpBitsPerPixel.Contains(bitsPerPixel))
-                    return RejectStructural(fileName, "BMP", $"Invalid BMP bits-per-pixel ({bitsPerPixel}).", "BMP-StructuralCheck");
+                    return RejectStructural(fileName, "BMP", $"Invalid BMP bits-per-pixel ({bitsPerPixel}).", "BMP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
                 if (bytes.Length >= 34)
                 {
                     uint compression = BitConverter.ToUInt32(bytes, 30);
                     // BI_RGB=0, BI_RLE8=1, BI_RLE4=2, BI_BITFIELDS=3, BI_JPEG=4, BI_PNG=5, BI_ALPHABITFIELDS=6
                     if (compression > 6)
-                        return RejectStructural(fileName, "BMP", $"Invalid BMP compression method ({compression}).", "BMP-StructuralCheck");
+                        return RejectStructural(fileName, "BMP", $"Invalid BMP compression method ({compression}).", "BMP-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
                 }
             }
 
@@ -1688,23 +1796,23 @@ namespace SecureFileUpload.Services
                 ImageInfo? info = Image.Identify(ms);
 
                 if (info is null)
-                    return RejectStructural(fileName, fileType, "Image metadata could not be identified.", $"{fileType}-StructuralCheck");
+                    return RejectStructural(fileName, fileType, "Image metadata could not be identified.", $"{fileType}-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
                 if (info.Width < 1 || info.Height < 1)
-                    return RejectStructural(fileName, fileType, "Invalid image dimensions.", $"{fileType}-StructuralCheck");
+                    return RejectStructural(fileName, fileType, "Invalid image dimensions.", $"{fileType}-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
 
                 if (info.Width > _options.MaxImageWidth || info.Height > _options.MaxImageHeight)
-                    return RejectPolicy(fileName, fileType, "Image dimensions exceed allowed limits.", $"{fileType}-DimensionLimit");
+                    return RejectPolicy(fileName, fileType, "Image dimensions exceed allowed limits.", $"{fileType}-DimensionLimit", UploadRejectionMessageKey.ImageTooLargeUploadSmaller);
 
                 long pixelCount = (long)info.Width * info.Height;
                 if (pixelCount > _options.MaxImagePixels)
-                    return RejectPolicy(fileName, fileType, "Image pixel count exceeds allowed limits.", $"{fileType}-PixelLimit");
+                    return RejectPolicy(fileName, fileType, "Image pixel count exceeds allowed limits.", $"{fileType}-PixelLimit", UploadRejectionMessageKey.ImageTooLargeUploadSmaller);
 
                 return null;
             }
             catch
             {
-                return RejectStructural(fileName, fileType, "Image failed structural validation.", $"{fileType}-StructuralCheck");
+                return RejectStructural(fileName, fileType, "Image failed structural validation.", $"{fileType}-StructuralCheck", UploadRejectionMessageKey.ImageRejectedGeneric);
             }
         }
 
@@ -1768,13 +1876,13 @@ namespace SecureFileUpload.Services
                 return RejectPolicy(
                     fileName, fileType,
                     "Compressed image metadata exceeds the safe inspection limit.",
-                    $"{fileType}-MetadataLimitExceeded");
+                    $"{fileType}-MetadataLimitExceeded", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             if (extraction.Status == MetadataExtractionStatus.Malformed)
                 return RejectStructural(
                     fileName, fileType,
                     "Compressed image metadata is malformed and could not be fully inspected.",
-                    $"{fileType}-MetadataMalformed");
+                    $"{fileType}-MetadataMalformed", UploadRejectionMessageKey.ImageRejectedGeneric);
 
             byte[] metadata = extraction.Metadata;
             if (metadata.Length > 0)
@@ -3206,7 +3314,8 @@ namespace SecureFileUpload.Services
         // ── Result helpers ────────────────────────────────────────────────────────
 
         private ContentValidationResult RejectStructural(
-            string fileName, string fileType, string reason, string validationType)
+            string fileName, string fileType, string reason, string validationType,
+            UploadRejectionMessageKey userMessageKey = UploadRejectionMessageKey.FileRejectedGeneric)
         {
             _logger.LogWarning(
                 "SECURITY_EVENT | DEEP_VALIDATION_REJECTED | Disposition: Structural | FileType: {FileType} | FileName: {FileName} | Reason: {Reason}",
@@ -3214,13 +3323,19 @@ namespace SecureFileUpload.Services
             return new ContentValidationResult
             {
                 IsValid = false, Disposition = ValidationDisposition.RejectedStructural,
-                ErrorMessage = $"File validation failed: {reason}", ThreatDescription = reason,
+                // ErrorMessage comes ONLY from the closed key set, never from `reason` — that
+                // string names the specific gate that fired and is an evasion oracle if shown.
+                // It stays in the log above and in ThreatDescription. The default key collapses
+                // any un-annotated gate to one generic, non-identifying string.
+                ErrorMessage = UploadRejectionMessages.Resolve(userMessageKey),
+                ThreatDescription = reason,
                 IsSuspicious = false, ValidationType = validationType
             };
         }
 
         private ContentValidationResult RejectPolicy(
-            string fileName, string fileType, string reason, string validationType)
+            string fileName, string fileType, string reason, string validationType,
+            UploadRejectionMessageKey userMessageKey = UploadRejectionMessageKey.FileRejectedGeneric)
         {
             _logger.LogWarning(
                 "SECURITY_EVENT | DEEP_VALIDATION_REJECTED | Disposition: Policy | FileType: {FileType} | FileName: {FileName} | Reason: {Reason}",
@@ -3228,7 +3343,10 @@ namespace SecureFileUpload.Services
             return new ContentValidationResult
             {
                 IsValid = false, Disposition = ValidationDisposition.RejectedPolicy,
-                ErrorMessage = reason, ThreatDescription = reason,
+                // Same closed-set rule as RejectStructural. This path previously assigned
+                // `reason` verbatim, which was the most direct form of the oracle.
+                ErrorMessage = UploadRejectionMessages.Resolve(userMessageKey),
+                ThreatDescription = reason,
                 IsSuspicious = true, ValidationType = validationType
             };
         }
