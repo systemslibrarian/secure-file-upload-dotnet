@@ -3,8 +3,95 @@
 All notable changes to `SecureFileUpload.Core` are recorded here. The package
 follows semantic versioning. `AssemblyVersion` is held at `3.0.0.0` across the
 entire `3.0.x` line so patch releases are drop-in upgrades with no
-binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`, and the
-whole `3.2.x` line holds at `3.2.0.0` because it changes no IL.
+binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`, the
+whole `3.2.x` line holds at `3.2.0.0` because it changes no IL, and `3.3.0` moves
+to `3.3.0.0`.
+
+## 3.3.0 — 2026-08-19 — Upload-pipeline hardening
+
+`AssemblyVersion` moves to `3.3.0.0`. Two of these changes close holes that were
+reachable on **default configuration** in `3.2.2` and every earlier `3.x`.
+
+### Security
+
+- **PDF object streams whose filter cannot be inspected are now rejected.** Object
+  streams are accepted by default (`RejectPdfObjectStreams = false`) on the stated
+  grounds that their contents are inflated and scanned. That promise did not hold:
+  the scan loop caught any inflation failure and moved on, so an object stream the
+  inflater could not read was skipped and the file accepted with its payload
+  unexamined. Defeating the compressed-stream scanner required only declaring a
+  filter it cannot process — `/Filter /LZWDecode` was enough.
+
+  Two shapes cause this and only one throws, so catching the exception is not
+  sufficient on its own: a non-Flate filter fails to inflate, while `FlateDecode`
+  with a non-identity `/Predictor` inflates *successfully* and yields
+  predictor-encoded bytes that are then scanned as meaningless noise. The gate runs
+  before inflation is attempted and covers both.
+
+  Scope is deliberately narrow. Only `/Type /ObjStm` is gated; ordinary content
+  streams that fail to inflate are still skipped, since rejecting those would fail
+  large numbers of legitimate documents for no security gain. Cross-reference
+  streams commonly carry `/Predictor 12` and are untouched for the same reason.
+  Controlled by the new `RejectUninspectableObjectStreams` (default `true`).
+
+- **Image decode memory is now bounded.** The sanitizing re-encode decodes every
+  accepted image, and its only bound was the deep validator's `MaxImagePixels`
+  (300,000,000 by default). That is a structural sanity limit, not a memory limit:
+  at roughly 4 bytes per pixel a 300 MP image is a ~1.2 GB bitmap, and a PNG
+  declaring those dimensions compresses to a few hundred kilobytes. A single upload
+  could cost a gigabyte of RAM, and nothing bounded how many decoded at once.
+
+  Two caps now gate the decode, read from `Image.Identify` so headers alone decide
+  and an over-cap file is refused before any pixels are materialized. Concurrent
+  decodes are bounded by a process-wide semaphore rather than a per-instance one,
+  which would give every request its own permit and bound nothing.
+
+- **Rejection messages no longer disclose which validation gate fired.**
+  `ContentValidationResult.ErrorMessage` carried the validator's internal reason —
+  verbatim from `RejectPolicy`, prefixed from `RejectStructural`. Callers are
+  expected to surface that field, so every rejection was a labeled oracle: an
+  attacker could learn which check blocked a payload ("Missing %%EOF trailer",
+  "Embedded ZIP detected at offset 1234") and tune the next attempt around it.
+  `RejectMalicious` was already opaque; these two were not.
+
+  `ErrorMessage` now resolves only from the closed `UploadRejectionMessageKey` set,
+  whose values are compile-time constants that never echo file-derived bytes. Every
+  PDF gate maps to one identical string so which check fired is not observable, with
+  password-protected PDFs the sole deliberate exception because it is actionable.
+  The reason still reaches the security log and `ThreatDescription`, which is for
+  diagnostics and is **not** safe to display.
+
+### Added
+
+- `UploadRejectionMessageKey` and `UploadRejectionMessages` (public) — the closed set
+  of user-safe rejection strings and its resolver.
+- `FileContentValidatorOptions.RejectUninspectableObjectStreams` (default `true`).
+- `FileUpload:MaxReencodeDecodePixels` (default 50,000,000) and
+  `FileUpload:MaxNonJpegDecodePixels` (default 24,000,000).
+- HEIC/HEIF containers are identified by their ISO-BMFF `ftyp` major brand.
+
+### Changed
+
+- **HEIC uploads are explained instead of being called malware.** HEIC is what
+  iPhones and iPads capture by default and the files are routinely renamed to `.jpg`.
+  Such an upload previously failed the magic-byte check and returned "File content
+  does not match its extension. File may be corrupted or malicious." — wrong on the
+  facts, and harmful, because training people to dismiss that warning devalues it for
+  the case that matters. The format is still refused; only the explanation changes,
+  and the event now logs at Information rather than as a `SECURITY_EVENT`.
+
+### Upgrading — behaviour changes
+
+- PNG and WebP uploads between 24 MP and the validator's `MaxImagePixels` are now
+  refused, as are JPEGs above 50 MP. A 600 dpi A4 scan is roughly 35 MP and would be
+  affected. Raise `FileUpload:MaxNonJpegDecodePixels` if you need those, understanding
+  that the decode cost scales with it.
+- PDFs containing an object stream with a non-Flate filter or a non-identity
+  `/Predictor` are now refused. Set `RejectUninspectableObjectStreams` to `false` to
+  restore the previous behaviour, understanding that such streams go unscanned.
+- `ContentValidationResult.ErrorMessage` no longer contains the specific reason. Code
+  that parsed or displayed it for detail should read `ThreatDescription` instead — in
+  logs, not in anything shown to the person who uploaded the file.
 
 ## 3.2.2 — 2026-08-19 — Dependency maintenance
 

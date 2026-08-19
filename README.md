@@ -210,7 +210,7 @@ Pick the TFM that matches your host:
 | .NET 9 (STS, in support)  | `net9.0` build      | Same source. |
 | .NET 10 (LTS, current)    | `net10.0` build     | Same source. |
 
-> **Upgrading from any `3.x`?** No public API break anywhere in the line, and the on-disk envelope formats (`ENCGCM\0\x01` / `ENCGCM\0\x02`) are byte-for-byte compatible throughout — no re-wrap, no migration. `AssemblyVersion` tracks the package version from `3.1.0` onward (it was held at `3.0.0.0` across the `3.0.x` patches), so coming from `3.0.x` on a framework that uses binding redirects, refresh them. Two behavioral changes are worth knowing about, both revertible by config: image recompression fails closed as of `3.1.0` (`FileUpload:RejectOnRecompressFailure`, default `true`), and `3.2.0` accepts PDF object streams and larger image dimensions rather than rejecting them (`RejectPdfObjectStreams`, `MaxImageWidth`/`Height`/`Pixels`). If you are coming from `2.x`, the `3.0.0` download-endpoint change is breaking — see *Earlier releases* above.
+> **Upgrading from any `3.x`?** No public API break anywhere in the line, and the on-disk envelope formats (`ENCGCM\0\x01` / `ENCGCM\0\x02`) are byte-for-byte compatible throughout — no re-wrap, no migration. `AssemblyVersion` tracks the package version from `3.1.0` onward (it was held at `3.0.0.0` across the `3.0.x` patches), so coming from `3.0.x` on a framework that uses binding redirects, refresh them. Behavioral changes worth knowing about, all revertible by config: image recompression fails closed as of `3.1.0` (`FileUpload:RejectOnRecompressFailure`, default `true`); `3.2.0` accepts PDF object streams and larger image dimensions rather than rejecting them (`RejectPdfObjectStreams`, `MaxImageWidth`/`Height`/`Pixels`); and `3.3.0` refuses object streams whose filter cannot be inspected (`RejectUninspectableObjectStreams`) and caps image decode size (`FileUpload:MaxNonJpegDecodePixels`, default 24 MP — a 600 dpi A4 scan is ~35 MP and is affected). `3.3.0` also stops putting the specific validation reason in `ContentValidationResult.ErrorMessage`; read `ThreatDescription` in logs instead, never in anything shown to the uploader. If you are coming from `2.x`, the `3.0.0` download-endpoint change is breaking — see *Earlier releases* above.
 
 ---
 
@@ -404,6 +404,8 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](https://g
     "RecompressImages": true,
     "JpegRecompressQuality": 95,
     "RejectOnRecompressFailure": true,
+    "MaxReencodeDecodePixels": 50000000,
+    "MaxNonJpegDecodePixels": 24000000,
     "EncryptionEnabled": false,
     "EncryptionSecret": "CHANGE_THIS_TO_A_REAL_SECRET_MINIMUM_32_CHARS",
     "KeyDerivation": {
@@ -428,6 +430,7 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](https://g
     "RejectEncryptedPdfs": true,
     "RejectInteractivePdfs": false,
     "RejectPdfObjectStreams": false,
+    "RejectUninspectableObjectStreams": true,
     "MaxImageWidth": 30000,
     "MaxImageHeight": 30000,
     "MaxImagePixels": 300000000
@@ -461,11 +464,13 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](https://g
 | `FileUpload:KeyDerivation:Argon2id:*` | Tune for your CPU/RAM budget. Library logs derivation time at startup. |
 | `FileUpload:KeyDerivation:LegacyKekFallback` | `true` (default) keeps PBKDF2 fallback KEKs available for *decryption only*. Set `false` after every file has been re-wrapped. |
 | `FileUpload:RecompressImages` | `true` (default) strips polyglot tails by re-encoding JPEG/PNG/WebP through ImageSharp. |
+| `FileUpload:MaxReencodeDecodePixels` / `MaxNonJpegDecodePixels` | Decode-memory guards (defaults `50000000` / `24000000`, 3.3.0). Read from headers only, so an over-cap image is refused before any pixels are materialized. JPEG gets the higher ceiling because legitimate phone and scanner output reaches into the tens of megapixels. Note a 600 dpi A4 scan is roughly 35 MP and exceeds the non-JPEG default. |
 | `FileUpload:RejectOnRecompressFailure` | `true` (default, 3.1.0) rejects the upload when the sanitizing re-encode fails — a header that parses but a decode that fails is the shape of a crafted polyglot. Set `false` to restore the pre-3.1.0 store-original-bytes fallback. |
 | `FileDownload:TokenLifetimeMinutes` | Lifetime for opaque download tokens issued by `IFileAccessTokenService`. Default 15 minutes; max 24 hours. |
 | `FileDownload:BindTokensToUser` | `false` (default). When `true`, download tokens are cryptographically bound to the issuing authenticated user; replay from any other account fails verification. |
 | `FileContent:RejectPdfObjectStreams` | `false` (default, 3.2.0). Object streams are standard in PDF 1.5+, so they are accepted and their inflated contents name-scanned. Set `true` only with a controlled PDF producer set — expect false rejections of ordinary phone-scanner and Office output. |
-| `FileContent:InspectCompressedPdfStreams` | `true` (default). Inflates FlateDecode stream payloads and re-runs name extraction plus the pattern scan. This is what makes `RejectPdfObjectStreams=false` safe. |
+| `FileContent:InspectCompressedPdfStreams` | `true` (default). Inflates FlateDecode stream payloads and re-runs name extraction plus the pattern scan. Together with `RejectUninspectableObjectStreams` this is what makes `RejectPdfObjectStreams=false` safe — inspection alone is not enough, because a stream the inflater cannot read was previously skipped rather than refused. |
+| `FileContent:RejectUninspectableObjectStreams` | `true` (default, 3.3.0). Refuses a `/Type /ObjStm` whose declared filter this validator cannot inflate — a non-Flate filter, or `FlateDecode` with a non-identity `/Predictor`. Without it, declaring such a filter is enough to have the stream's contents skipped and the file accepted unexamined. Only object streams are gated; ordinary content streams that fail to inflate are still skipped. |
 | `FileContent:MaxDecompressionRatio` / `MaxPdfStreamScanMilliseconds` | Decompression-bomb guards: per-stream inflate ratio (default `200×`) and per-file wall-clock budget for the stream scan (default `2000` ms). |
 | `FileContent:MaxImageWidth` / `MaxImageHeight` / `MaxImagePixels` | Pixel-bomb guards only (defaults `30000` / `30000` / `300000000`, raised in 3.2.0). `FileUpload:MaxFileSizeBytes` remains the primary size guard. |
 | `FileContent:RejectEncryptedPdfs` / `RejectInteractivePdfs` | Reject `/Encrypt` PDFs (`true` by default — their contents cannot be scanned) and `/AcroForm` PDFs (`false` by default). |

@@ -19,17 +19,17 @@
 
     <!-- ── NuGet package metadata ─────────────────────────────────────── -->
     <PackageId>SecureFileUpload.Core</PackageId>
-    <Version>3.2.2</Version>
+    <Version>3.3.0</Version>
     <!--
-      AssemblyVersion deliberately held at 3.2.0.0 across the whole 3.2.x line.
-      3.2.2 is a dependency-maintenance release: no .cs file changed, only the
-      ImageSharp patch floor and build/test tooling. Holding the assembly
-      version makes this a drop-in upgrade from 3.2.0 and 3.2.1 with no
-      binding-redirect churn on frameworks that use them.
+      AssemblyVersion moves to 3.3.0.0. The whole 3.2.x line held at 3.2.0.0 because
+      no IL changed across it. 3.3.0 changes the validator and the upload service,
+      adds public types (UploadRejectionMessageKey, UploadRejectionMessages) and new
+      options, so it takes its own assembly version rather than pretending to be a
+      drop-in for 3.2.x.
     -->
-    <AssemblyVersion>3.2.0.0</AssemblyVersion>
-    <FileVersion>3.2.2.0</FileVersion>
-    <InformationalVersion>3.2.2</InformationalVersion>
+    <AssemblyVersion>3.3.0.0</AssemblyVersion>
+    <FileVersion>3.3.0.0</FileVersion>
+    <InformationalVersion>3.3.0</InformationalVersion>
     <Authors>Paul Clark (systemslibrarian)</Authors>
     <Company>systemslibrarian</Company>
     <Product>SecureFileUpload.Core</Product>
