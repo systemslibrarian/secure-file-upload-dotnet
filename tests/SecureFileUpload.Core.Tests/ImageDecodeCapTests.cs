@@ -66,6 +66,25 @@ public sealed class ImageDecodeCapTests
         Assert.True(result.Success, result.Errors.Count > 0 ? result.Errors[0] : "no error reported");
     }
 
+    [Fact]
+    public async Task Over_cap_respects_RejectOnRecompressFailure_when_it_is_disabled()
+    {
+        // An over-cap image is the same situation RejectOnRecompressFailure governs: we
+        // cannot sanitize it. With the flag off the operator has asked for the original to
+        // be stored rather than the upload refused. The memory bound still holds either way,
+        // because no decode happens in either branch — the flag only decides storage.
+        var result = await UploadAsync(
+            SmallPng(), "scan.png", "image/png",
+            extraConfig: new()
+            {
+                ["FileUpload:MaxNonJpegDecodePixels"] = "100",
+                ["FileUpload:RejectOnRecompressFailure"] = "false",
+            });
+
+        Assert.True(result.Success, result.Errors.Count > 0 ? result.Errors[0] : "no error reported");
+        Assert.Single(result.UploadedFilePaths);
+    }
+
     private static byte[] SmallPng()
     {
         using var image = new Image<Rgba32>(50, 50);

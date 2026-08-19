@@ -42,9 +42,14 @@ reachable on **default configuration** in `3.2.2` and every earlier `3.x`.
   could cost a gigabyte of RAM, and nothing bounded how many decoded at once.
 
   Two caps now gate the decode, read from `Image.Identify` so headers alone decide
-  and an over-cap file is refused before any pixels are materialized. Concurrent
-  decodes are bounded by a process-wide semaphore rather than a per-instance one,
-  which would give every request its own permit and bound nothing.
+  and an over-cap file is stopped before any pixels are materialized. What happens
+  then follows the existing `FileUpload:RejectOnRecompressFailure`, since an
+  over-cap image is the same situation that flag already governs — the image cannot
+  be sanitized — so it is refused by default or stored undecoded if you have turned
+  that off. No decode happens in either branch, so the memory bound holds
+  regardless. Concurrent decodes are bounded by a process-wide semaphore rather than
+  a per-instance one, which would give every request its own permit and bound
+  nothing.
 
 - **Rejection messages no longer disclose which validation gate fired.**
   `ContentValidationResult.ErrorMessage` carried the validator's internal reason —
@@ -85,7 +90,9 @@ reachable on **default configuration** in `3.2.2` and every earlier `3.x`.
 - PNG and WebP uploads between 24 MP and the validator's `MaxImagePixels` are now
   refused, as are JPEGs above 50 MP. A 600 dpi A4 scan is roughly 35 MP and would be
   affected. Raise `FileUpload:MaxNonJpegDecodePixels` if you need those, understanding
-  that the decode cost scales with it.
+  that the decode cost scales with it. If you already run with
+  `FileUpload:RejectOnRecompressFailure = false`, over-cap images are stored
+  undecoded instead of refused, so nothing starts failing for you.
 - PDFs containing an object stream with a non-Flate filter or a non-identity
   `/Predictor` are now refused. Set `RejectUninspectableObjectStreams` to `false` to
   restore the previous behaviour, understanding that such streams go unscanned.

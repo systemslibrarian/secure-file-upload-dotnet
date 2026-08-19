@@ -1426,6 +1426,7 @@ namespace SecureFileUpload.Services
             }
             catch (Exception ex)
             {
+                CryptographicOperations.ZeroMemory(original);
                 throw new ImageSanitizationException(
                     "Image dimensions could not be read before re-encoding.", ex);
             }
@@ -1435,12 +1436,28 @@ namespace SecureFileUpload.Services
 
             if (declaredPixels > decodeCap)
             {
+                // Over the cap we decline to decode. That is the same situation
+                // RejectOnRecompressFailure already governs — "we cannot sanitize this
+                // image, now what" — so it is honoured here rather than hard-rejecting.
+                // Either way no decode happens, so the memory bound holds in both branches;
+                // the flag only decides whether the unsanitized original is stored.
+                if (_rejectOnRecompressFailure)
+                {
+                    _logger.LogWarning(
+                        "SECURITY_EVENT | IMAGE_DECODE_CAP_EXCEEDED_REJECTED | Ext: {Ext} | DeclaredPixels: {Pixels:N0} | Cap: {Cap:N0} | " +
+                        "Refused before decoding to bound peak memory (FileUpload:RejectOnRecompressFailure=true).",
+                        extension, declaredPixels, decodeCap);
+                    CryptographicOperations.ZeroMemory(original);
+                    throw new ImageSanitizationException(
+                        $"Image declares {declaredPixels:N0} pixels, above the {decodeCap:N0} decode cap.");
+                }
+
                 _logger.LogWarning(
-                    "SECURITY_EVENT | IMAGE_DECODE_CAP_EXCEEDED | Ext: {Ext} | DeclaredPixels: {Pixels:N0} | Cap: {Cap:N0} | " +
-                    "Refused before decoding to bound peak memory",
+                    "SECURITY_EVENT | IMAGE_DECODE_CAP_EXCEEDED_FALLBACK | Ext: {Ext} | DeclaredPixels: {Pixels:N0} | Cap: {Cap:N0} | " +
+                    "Storing original validated bytes undecoded (FileUpload:RejectOnRecompressFailure=false). " +
+                    "Any data appended after the image's structural end is preserved on disk.",
                     extension, declaredPixels, decodeCap);
-                throw new ImageSanitizationException(
-                    $"Image declares {declaredPixels:N0} pixels, above the {decodeCap:N0} decode cap.");
+                return original;
             }
 
             // Bound concurrent decodes process-wide. Without this, R concurrent uploads each
