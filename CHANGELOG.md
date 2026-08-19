@@ -4,8 +4,56 @@ All notable changes to `SecureFileUpload.Core` are recorded here. The package
 follows semantic versioning. `AssemblyVersion` is held at `3.0.0.0` across the
 entire `3.0.x` line so patch releases are drop-in upgrades with no
 binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`, the
-whole `3.2.x` line holds at `3.2.0.0` because it changes no IL, and `3.3.0` moves
-to `3.3.0.0`.
+whole `3.2.x` line holds at `3.2.0.0` because it changes no IL, and the `3.3.x`
+line holds at `3.3.0.0`.
+
+## 3.3.1 — 2026-08-19 — Decode cap raised; 3.3.0 notes corrected
+
+`AssemblyVersion` stays at `3.3.0.0`. Drop-in upgrade from `3.3.0`.
+
+### Changed
+
+- **`FileUpload:MaxNonJpegDecodePixels` default raised from 24 MP to 40 MP.** A 600 dpi
+  A4 scan is roughly 35 MP, so the 24 MP default refused a mainstream way of submitting
+  a document. 40 MP still bounds a single decode at about 160 MB, and the process-wide
+  decode semaphore bounds how many run at once. JPEG keeps the higher 50 MP ceiling
+  because it has a reduced-resolution decode path that PNG and WebP do not.
+
+### Note on the 3.3.0 release notes
+
+The `3.3.0` notes below were written before an adversarial review of that release's own
+hardening, and understate it. `3.3.0` shipped with the review's findings fixed, but its
+notes describe only the first version of the object-stream gate. Recorded here for anyone
+auditing what `3.3.0` actually contains:
+
+- **The object-stream gate checks whether contents were read, not what the file declares.**
+  The first implementation trusted the stream dictionary and was bypassable by declaring
+  `/FlateDecode` over bytes that are not deflate, by parking decoy streams ahead of the
+  payload to exhaust the scan budget, by omitting `/Filter` entirely, and by padding the
+  dictionary past the lookback window. Every path that skips an object stream now counts it
+  as unscanned, and a document declaring `/ObjStm` with any unscanned object stream is
+  refused.
+- **Hex-escaped names are resolved before matching.** PDF 32000-1 §7.3.5 makes
+  `/Type /Obj#53tm` equivalent to `/Type /ObjStm`, and every real reader resolves it. The
+  document-level name extractor decoded escapes while the stream-level classifier did not,
+  so writing the name escaped left the document counted as declaring an object stream while
+  the stream itself classified as ordinary — switching the gate off entirely.
+- **An unterminated literal string is now malformed.** *This one predates 3.3.0 and affects
+  `3.2.2` and every earlier `3.x`.* An unclosed `(` made the lexer blank everything to
+  end-of-file with no malformed flag, so any `/ObjStm`, `/JS` or `/Launch` declared after it
+  was invisible to every surface scan and the stream ranges beyond it were never recorded.
+  Opening a bracket and never closing it was a complete bypass of PDF content validation.
+  **If you are pinned to `3.2.x`, this is the reason to upgrade.**
+- **Nested stream scanning uses the correct surface.** Recursion classified inner streams
+  against the outer document's text using offsets into the inflated buffer, reading whatever
+  happened to sit at those positions.
+- **A truncated object stream is not a scanned object stream.** Hitting the byte budget or
+  the time budget mid-stream left the remainder unexamined while the file passed. Object
+  streams also get their own byte budget, so an image-heavy document cannot exhaust the pool
+  and cause a legitimate file to be refused.
+- **Animated PNG and WebP are detected by walking chunk tables**, not by searching raw bytes
+  for `acTL`/`ANIM`/`ANMF`. The byte search matched inside compressed pixel data often enough
+  to refuse roughly 1 in 400 still WebP photographs.
 
 ## 3.3.0 — 2026-08-19 — Upload-pipeline hardening
 

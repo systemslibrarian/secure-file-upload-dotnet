@@ -403,8 +403,11 @@ namespace SecureFileUpload.Services
             // because over-cap files of those types are rare and materialize a full bitmap.
             _maxReencodeDecodePixels = _configuration.GetValue<long>(
                 "FileUpload:MaxReencodeDecodePixels", 50_000_000);
+            // 40 MP, not 24: a 600 dpi A4 scan is ~35 MP, and refusing those refuses a
+            // mainstream way of submitting a document. At ~4 bytes per pixel this bounds one
+            // decode at ~160 MB, and ReencodeConcurrency bounds how many run at once.
             _maxNonJpegDecodePixels = _configuration.GetValue<long>(
-                "FileUpload:MaxNonJpegDecodePixels", 24_000_000);
+                "FileUpload:MaxNonJpegDecodePixels", 40_000_000);
             _jpegRecompressQuality = Math.Clamp(
                 _configuration.GetValue<int>("FileUpload:JpegRecompressQuality", 95), 1, 100);
             // Fail-closed by default: if the sanitizing re-encode fails, the polyglot-tail

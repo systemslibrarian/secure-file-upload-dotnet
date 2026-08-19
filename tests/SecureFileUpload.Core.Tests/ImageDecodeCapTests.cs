@@ -148,6 +148,54 @@ public sealed class ImageDecodeCapTests
         return -1;
     }
 
+    [Fact]
+    public void Default_non_jpeg_cap_admits_a_600dpi_A4_scan()
+    {
+        // The reason the default moved from 24 MP to 40 MP. A 600 dpi A4 page is
+        // 4960 x 7016 = ~34.8 MP, and refusing that refused a mainstream way of submitting
+        // a document. Asserted by reading the resolved field rather than by decoding a real
+        // 35 MP image, which would allocate ~140 MB in CI to prove a memory guard.
+        const long SixHundredDpiA4Pixels = 4960L * 7016L;
+
+        string root = Path.Combine(Path.GetTempPath(), "sfu-def-" + Guid.NewGuid().ToString("N"));
+        string contentRoot = Path.Combine(root, "content");
+        Directory.CreateDirectory(Path.Combine(contentRoot, "wwwroot"));
+        Directory.CreateDirectory(Path.Combine(root, "uploads"));
+        try
+        {
+            var configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["FileUpload:StorageRoot"] = Path.Combine(root, "uploads"),
+                    ["FileUpload:EncryptionEnabled"] = "false",
+                    ["VirusScan:Enabled"] = "false",
+                })
+                .Build();
+
+            var service = new FileUploadService(
+                NullLogger<FileUploadService>.Instance,
+                configuration,
+                new CapStubWebHostEnvironment(contentRoot, Path.Combine(contentRoot, "wwwroot")),
+                new FileContentValidator(
+                    NullLogger<FileContentValidator>.Instance,
+                    Options.Create(new FileContentValidatorOptions())),
+                new CapCleanScanService());
+
+            var field = typeof(FileUploadService).GetField(
+                "_maxNonJpegDecodePixels",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            Assert.NotNull(field);
+
+            long cap = (long)field!.GetValue(service)!;
+            Assert.True(cap >= SixHundredDpiA4Pixels,
+                $"Non-JPEG decode cap {cap:N0} would refuse a 600 dpi A4 scan ({SixHundredDpiA4Pixels:N0} px).");
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
     private static byte[] SmallPng()
     {
         using var image = new Image<Rgba32>(50, 50);
