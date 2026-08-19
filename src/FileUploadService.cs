@@ -81,6 +81,11 @@ namespace SecureFileUpload.Services
     /// </summary>
     internal sealed class ImageSanitizationException : Exception
     {
+        public ImageSanitizationException(string message)
+            : base(message)
+        {
+        }
+
         public ImageSanitizationException(string message, Exception innerException)
             : base(message, innerException)
         {
@@ -127,6 +132,18 @@ namespace SecureFileUpload.Services
         private readonly bool _virusScanEnabled;       // mirrors VirusScan:Enabled in appsettings
         private readonly bool _failClosedOnUnavailable; // VirusScan:FailClosedOnUnavailable, default false
         private readonly bool _recompressImages;       // Gap 1 mitigation — strips polyglot tails on write
+        private readonly long _maxReencodeDecodePixels;   // JPEG decode ceiling
+        private readonly long _maxNonJpegDecodePixels;    // PNG/WebP decode ceiling
+
+        // Bounds how many full image decodes run at once across the WHOLE process.
+        //
+        // This is deliberately STATIC. Consumers register IFileUploadService as scoped or
+        // transient, so a per-instance semaphore would hand every request its own permit and
+        // bound nothing — the limit has to outlive the instance to mean anything. Within a
+        // single request files are decoded sequentially, so a per-instance gate would never
+        // engage at all.
+        private static readonly SemaphoreSlim ReencodeConcurrency =
+            new(Math.Max(1, Environment.ProcessorCount / 2), Math.Max(1, Environment.ProcessorCount / 2));
         private readonly int _jpegRecompressQuality;   // 1–100, default 95
         private readonly bool _rejectOnRecompressFailure; // Gap 1 fail-closed: reject upload when sanitizing re-encode fails
 
@@ -374,6 +391,20 @@ namespace SecureFileUpload.Services
             // the image's structural end (polyglot tails, embedded executables, scripts).
             // Default: enabled. Disable only if you must preserve byte-exact original images.
             _recompressImages = _configuration.GetValue<bool>("FileUpload:RecompressImages", true);
+
+            // Decode ceilings for the sanitizing re-encode. The deep validator's
+            // MaxImagePixels (300 MP by default) is a structural sanity bound, not a memory
+            // bound: at ~4 bytes per pixel a 300 MP image is a ~1.2 GB bitmap, and a PNG
+            // declaring those dimensions compresses to a few hundred KB. These caps bound
+            // what is actually decoded.
+            //
+            // JPEG is allowed the higher ceiling because legitimate modern phone and scanner
+            // output reaches into the tens of megapixels; PNG and WebP get the lower one
+            // because over-cap files of those types are rare and materialize a full bitmap.
+            _maxReencodeDecodePixels = _configuration.GetValue<long>(
+                "FileUpload:MaxReencodeDecodePixels", 50_000_000);
+            _maxNonJpegDecodePixels = _configuration.GetValue<long>(
+                "FileUpload:MaxNonJpegDecodePixels", 24_000_000);
             _jpegRecompressQuality = Math.Clamp(
                 _configuration.GetValue<int>("FileUpload:JpegRecompressQuality", 95), 1, 100);
             // Fail-closed by default: if the sanitizing re-encode fails, the polyglot-tail
@@ -1383,6 +1414,38 @@ namespace SecureFileUpload.Services
             if (!_recompressImages || !isRecompressable)
                 return original;
 
+            // Read the declared dimensions WITHOUT decoding. Image.Identify parses headers
+            // only, so an over-cap image is refused before a single pixel is materialized —
+            // which is the whole point: the bomb is cheap to send and expensive to decode.
+            long declaredPixels;
+            try
+            {
+                using var probeMs = new MemoryStream(original, writable: false);
+                var info = Image.Identify(probeMs);
+                declaredPixels = (long)info.Width * info.Height;
+            }
+            catch (Exception ex)
+            {
+                throw new ImageSanitizationException(
+                    "Image dimensions could not be read before re-encoding.", ex);
+            }
+
+            bool isJpeg = extension == ".jpg" || extension == ".jpeg";
+            long decodeCap = isJpeg ? _maxReencodeDecodePixels : _maxNonJpegDecodePixels;
+
+            if (declaredPixels > decodeCap)
+            {
+                _logger.LogWarning(
+                    "SECURITY_EVENT | IMAGE_DECODE_CAP_EXCEEDED | Ext: {Ext} | DeclaredPixels: {Pixels:N0} | Cap: {Cap:N0} | " +
+                    "Refused before decoding to bound peak memory",
+                    extension, declaredPixels, decodeCap);
+                throw new ImageSanitizationException(
+                    $"Image declares {declaredPixels:N0} pixels, above the {decodeCap:N0} decode cap.");
+            }
+
+            // Bound concurrent decodes process-wide. Without this, R concurrent uploads each
+            // materialize their own bitmap and peak memory scales with traffic, not with the cap.
+            await ReencodeConcurrency.WaitAsync();
             try
             {
                 using var inMs = new MemoryStream(original, writable: false);
@@ -1435,6 +1498,10 @@ namespace SecureFileUpload.Services
                     "Any data appended after the image's structural end is preserved on disk.",
                     extension);
                 return original;
+            }
+            finally
+            {
+                ReencodeConcurrency.Release();
             }
         }
 
