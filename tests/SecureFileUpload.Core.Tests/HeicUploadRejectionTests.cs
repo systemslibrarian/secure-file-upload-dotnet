@@ -72,7 +72,14 @@ public sealed class HeicUploadRejectionTests
     private static async Task<FileUploadResult> UploadAsync(
         byte[] bytes, string fileName, string contentType)
     {
-        string root = Path.Combine(Path.GetTempPath(), "sfu-heic-" + Guid.NewGuid().ToString("N"));
+        // StorageRoot must NOT sit under wwwroot — the service refuses that outright, since
+        // uploads under the web root would be directly servable. Mirror the real layout:
+        // content/wwwroot for the host, a sibling "uploads" directory for storage.
+        string workRoot = Path.Combine(Path.GetTempPath(), "sfu-heic-" + Guid.NewGuid().ToString("N"));
+        string contentRoot = Path.Combine(workRoot, "content");
+        string webRoot = Path.Combine(contentRoot, "wwwroot");
+        string root = Path.Combine(workRoot, "uploads");
+        Directory.CreateDirectory(webRoot);
         Directory.CreateDirectory(root);
         try
         {
@@ -89,7 +96,7 @@ public sealed class HeicUploadRejectionTests
             var service = new FileUploadService(
                 NullLogger<FileUploadService>.Instance,
                 configuration,
-                new HeicStubWebHostEnvironment(root),
+                new HeicStubWebHostEnvironment(contentRoot, webRoot),
                 new FileContentValidator(
                     NullLogger<FileContentValidator>.Instance,
                     Options.Create(new FileContentValidatorOptions())),
@@ -106,18 +113,18 @@ public sealed class HeicUploadRejectionTests
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { /* best effort */ }
+            try { Directory.Delete(workRoot, recursive: true); } catch { /* best effort */ }
         }
     }
 
     private sealed class HeicStubWebHostEnvironment : IWebHostEnvironment
     {
-        public HeicStubWebHostEnvironment(string rootPath)
+        public HeicStubWebHostEnvironment(string contentRootPath, string webRootPath)
         {
-            ContentRootPath = rootPath;
-            WebRootPath = rootPath;
-            ContentRootFileProvider = new PhysicalFileProvider(rootPath);
-            WebRootFileProvider = new PhysicalFileProvider(rootPath);
+            ContentRootPath = contentRootPath;
+            WebRootPath = webRootPath;
+            ContentRootFileProvider = new PhysicalFileProvider(contentRootPath);
+            WebRootFileProvider = new PhysicalFileProvider(webRootPath);
         }
 
         public string ApplicationName { get; set; } = "SecureFileUpload.Core.Tests";

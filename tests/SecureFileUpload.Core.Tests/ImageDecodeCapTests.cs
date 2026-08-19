@@ -86,7 +86,14 @@ public sealed class ImageDecodeCapTests
         byte[] bytes, string fileName, string contentType,
         Dictionary<string, string?>? extraConfig = null)
     {
-        string root = Path.Combine(Path.GetTempPath(), "sfu-cap-" + Guid.NewGuid().ToString("N"));
+        // StorageRoot must NOT sit under wwwroot — the service refuses that outright, since
+        // uploads under the web root would be directly servable. Mirror the real layout:
+        // content/wwwroot for the host, a sibling "uploads" directory for storage.
+        string workRoot = Path.Combine(Path.GetTempPath(), "sfu-cap-" + Guid.NewGuid().ToString("N"));
+        string contentRoot = Path.Combine(workRoot, "content");
+        string webRoot = Path.Combine(contentRoot, "wwwroot");
+        string root = Path.Combine(workRoot, "uploads");
+        Directory.CreateDirectory(webRoot);
         Directory.CreateDirectory(root);
         try
         {
@@ -107,7 +114,7 @@ public sealed class ImageDecodeCapTests
             var service = new FileUploadService(
                 NullLogger<FileUploadService>.Instance,
                 configuration,
-                new CapStubWebHostEnvironment(root),
+                new CapStubWebHostEnvironment(contentRoot, webRoot),
                 new FileContentValidator(
                     NullLogger<FileContentValidator>.Instance,
                     Options.Create(new FileContentValidatorOptions())),
@@ -124,18 +131,18 @@ public sealed class ImageDecodeCapTests
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { /* best effort */ }
+            try { Directory.Delete(workRoot, recursive: true); } catch { /* best effort */ }
         }
     }
 
     private sealed class CapStubWebHostEnvironment : IWebHostEnvironment
     {
-        public CapStubWebHostEnvironment(string rootPath)
+        public CapStubWebHostEnvironment(string contentRootPath, string webRootPath)
         {
-            ContentRootPath = rootPath;
-            WebRootPath = rootPath;
-            ContentRootFileProvider = new PhysicalFileProvider(rootPath);
-            WebRootFileProvider = new PhysicalFileProvider(rootPath);
+            ContentRootPath = contentRootPath;
+            WebRootPath = webRootPath;
+            ContentRootFileProvider = new PhysicalFileProvider(contentRootPath);
+            WebRootFileProvider = new PhysicalFileProvider(webRootPath);
         }
 
         public string ApplicationName { get; set; } = "SecureFileUpload.Core.Tests";
