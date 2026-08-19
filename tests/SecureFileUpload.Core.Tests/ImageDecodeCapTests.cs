@@ -7,6 +7,7 @@ using Microsoft.Extensions.Options;
 using SecureFileUpload.Services;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
+using System.Text;
 using Xunit;
 
 namespace SecureFileUpload.Core.Tests;
