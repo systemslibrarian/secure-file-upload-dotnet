@@ -1713,10 +1713,10 @@ namespace SecureFileUpload.Services
                                     headerBytes[8]  != 0x57 || headerBytes[9]  != 0x45 ||
                                     headerBytes[10] != 0x42 || headerBytes[11] != 0x50)
                                 {
-                                    return (false, headerHex, "RIFF container but not WebP (possibly AVI/WAV)");
+                                    return (false, headerHex, "RIFF container but not WebP (possibly AVI/WAV)", false);
                                 }
                             }
-                            return (true, headerHex, null);
+                            return (true, headerHex, null, false);
                         }
                     }
                 }
