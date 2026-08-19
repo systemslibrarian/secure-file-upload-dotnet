@@ -901,6 +901,7 @@ namespace SecureFileUpload.Services
                 {
                     int start = i;
                     int depth = 0;
+                    bool closed = false;
                     while (i < content.Length)
                     {
                         char s = content[i];
@@ -909,10 +910,19 @@ namespace SecureFileUpload.Services
                         else if (s == ')')
                         {
                             depth--;
-                            if (depth == 0) { i++; break; }
+                            if (depth == 0) { i++; closed = true; break; }
                         }
                         i++;
                     }
+
+                    // An unterminated literal string swallows the whole remainder of the
+                    // document: everything past it is blanked, so any /ObjStm, /JS or /Launch
+                    // declared afterwards becomes invisible to every surface scan and the
+                    // stream ranges beyond it are never recorded. Opening a bracket and never
+                    // closing it would otherwise be a complete bypass. No real producer emits
+                    // one, so this fails closed at no false-positive cost.
+                    if (!closed) malformed = true;
+
                     sb.Append(' ', Math.Min(i, content.Length) - start);
                     continue;
                 }
@@ -1425,14 +1435,19 @@ namespace SecureFileUpload.Services
             public int MaxStreams;
             public int MaxDecompressedBytes;
 
-            /// <summary>Surface with strings, comments and stream payloads blanked, 1:1 offsets.</summary>
-            public string DictContent = string.Empty;
-
             /// <summary>True when the document surface declares /ObjStm anywhere.</summary>
             public bool DocumentDeclaresObjStm;
 
             /// <summary>Object streams whose contents could not be read and therefore not scanned.</summary>
             public int ObjStmUnscanned;
+
+            /// <summary>
+            /// Bytes inflated from object streams, budgeted separately from ordinary content.
+            /// Sharing one pool meant a document full of images could exhaust it and leave an
+            /// object stream unread — which now rejects, so a shared pool would turn ordinary
+            /// large documents into rejections.
+            /// </summary>
+            public int ObjStmDecompressed;
 
             /// <summary>Set when a budget or cap ended the ordinary-stream walk early.</summary>
             public bool OrdinaryScanTruncated;
@@ -1452,13 +1467,12 @@ namespace SecureFileUpload.Services
                 RatioCap                 = _options.MaxDecompressionRatio,
                 MaxStreams               = _options.MaxCompressedStreamsToInspect,
                 MaxDecompressedBytes     = _options.MaxDecompressedStreamBytes,
-                DictContent              = dictContent,
                 DocumentDeclaresObjStm   = documentDeclaresObjStm,
             };
             state.Deadline.Start();
 
             var result = ScanCompressedPdfStreamsCore(
-                bytes, streamRanges, fileName, depth: 0, state, cancellationToken);
+                bytes, streamRanges, fileName, dictContent, depth: 0, state, cancellationToken);
 
             // Fail closed on the PROMISE, not on the declaration. Object streams are accepted
             // by default only because their contents get scanned; if any object stream's
@@ -1492,10 +1506,17 @@ namespace SecureFileUpload.Services
             return result;
         }
 
+        /// <param name="dictSurface">
+        /// The blanked surface for <paramref name="bytes"/> specifically. Stream offsets index
+        /// the buffer they were extracted from, so a nested call must receive the INFLATED
+        /// buffer's surface — reusing the outer document's would read dictionaries at unrelated
+        /// offsets and classify nested streams from whatever text happened to sit there.
+        /// </param>
         private ContentValidationResult? ScanCompressedPdfStreamsCore(
             byte[] bytes,
             List<(int Start, int End)> streamRanges,
             string fileName,
+            string dictSurface,
             int depth,
             PdfStreamScanState state,
             CancellationToken cancellationToken)
@@ -1519,7 +1540,7 @@ namespace SecureFileUpload.Services
                 // Classification only matters when the document declares /ObjStm; skipping it
                 // otherwise keeps ordinary PDFs off the dictionary-reading path entirely.
                 PdfStreamKind kind = state.DocumentDeclaresObjStm
-                    ? ClassifyStream(state.DictContent, start)
+                    ? ClassifyStream(dictSurface, start)
                     : PdfStreamKind.Ordinary;
 
                 if (kind == PdfStreamKind.Ordinary) ordinaryRanges.Add((start, end, kind));
@@ -1602,7 +1623,9 @@ namespace SecureFileUpload.Services
                     continue;
                 }
 
-                int budget = state.MaxDecompressedBytes - state.TotalDecompressed;
+                int budget = strict
+                    ? state.MaxDecompressedBytes - state.ObjStmDecompressed
+                    : state.MaxDecompressedBytes - state.TotalDecompressed;
                 if (budget <= 0)
                 {
                     // Ordinary streams stop here. A strict stream must not: dropping it for
@@ -1614,16 +1637,19 @@ namespace SecureFileUpload.Services
                 }
 
                 byte[] inflated;
+                bool truncated = false;
 
                 // An object stream with no /Filter is stored literally: its bytes ARE the
                 // content. Deflate would throw on them and the catch would then record a
                 // false "unscanned", so take them as-is and let the identical downstream
                 // name-extraction, ratio check and nested recursion run over them.
-                if (strict && !DeclaresAnyFilter(state.DictContent, start))
+                if (strict && !DeclaresAnyFilter(dictSurface, start))
                 {
-                    inflated = new byte[rawLen];
-                    Array.Copy(bytes, start, inflated, 0, rawLen);
-                    deflateLen = rawLen;   // ratio 1:1 — nothing was compressed
+                    int take = Math.Min(rawLen, budget);
+                    inflated = new byte[take];
+                    Array.Copy(bytes, start, inflated, 0, take);
+                    deflateLen = take;          // ratio 1:1 — nothing was compressed
+                    truncated = take < rawLen;  // the remainder went unexamined
                 }
                 else
                 {
@@ -1635,13 +1661,17 @@ namespace SecureFileUpload.Services
                         var buf = new byte[8192];
                         int read;
                         int written = 0;
+                        truncated = false;
                         while ((read = inflater.Read(buf, 0, buf.Length)) > 0)
                         {
                             written += read;
                             if (written > budget)
                             {
-                                // Over the per-file budget: keep what fits and stop this stream.
+                                // Over budget: keep what fits and stop this stream. The tail was
+                                // never examined, which for an object stream is exactly the
+                                // "contents not scanned" condition.
                                 dst.Write(buf, 0, read - (written - budget));
+                                truncated = true;
                                 break;
                             }
                             dst.Write(buf, 0, read);
@@ -1649,7 +1679,11 @@ namespace SecureFileUpload.Services
                             // Re-check the wall-clock and cancellation budgets while streaming —
                             // a single huge inflate must not block past the cap.
                             cancellationToken.ThrowIfCancellationRequested();
-                            if (state.Deadline.ElapsedMilliseconds > state.TimeoutMs) break;
+                            if (state.Deadline.ElapsedMilliseconds > state.TimeoutMs)
+                            {
+                                truncated = true;
+                                break;
+                            }
                         }
                         inflated = dst.ToArray();
                     }
@@ -1677,7 +1711,16 @@ namespace SecureFileUpload.Services
                     if (strict) state.ObjStmUnscanned++;
                     continue;
                 }
-                state.TotalDecompressed += inflated.Length;
+                if (strict) state.ObjStmDecompressed += inflated.Length;
+                else state.TotalDecompressed += inflated.Length;
+
+                // A partially-read object stream is not a scanned object stream. Counting it as
+                // one would leave whatever sat past the cut-off unexamined while the file passed.
+                if (strict && truncated)
+                {
+                    state.ObjStmUnscanned++;
+                    continue;
+                }
 
                 // Decompression-ratio bomb check. Legitimate FlateDecode over document
                 // content rarely exceeds ~10x.
@@ -1717,8 +1760,10 @@ namespace SecureFileUpload.Services
 
                 if (nested is { Count: > 0 })
                 {
+                    // inflatedDict is the surface for `inflated`, with the same 1:1 offsets
+                    // the nested ranges were recorded against.
                     var inner = ScanCompressedPdfStreamsCore(
-                        inflated, nested, fileName, depth + 1, state, cancellationToken);
+                        inflated, nested, fileName, inflatedDict, depth + 1, state, cancellationToken);
                     if (inner != null) return inner;
                 }
             }
@@ -1777,9 +1822,11 @@ namespace SecureFileUpload.Services
         /// </summary>
         private static string? ReadStreamDictionary(string dictContent, int dataStart)
         {
-            // Generous window: a dictionary padded past it lands in PdfStreamKind.Unknown,
-            // which the strict pass rejects rather than skips, so padding buys nothing.
-            const int MaxLookback = 65536;
+            // 4 KB deliberately: a dictionary padded past it lands in PdfStreamKind.Unknown,
+            // which joins the strict pass, so padding buys nothing and a bigger window would
+            // only add cost. Staying under the 85 KB large-object threshold also keeps the
+            // per-stream substring in gen0 rather than on the LOH.
+            const int MaxLookback = 4096;
 
             if (dataStart <= 0 || dataStart > dictContent.Length) return null;
 
@@ -1806,7 +1853,11 @@ namespace SecureFileUpload.Services
                 if (window[cursor] == '<' && window[cursor - 1] == '<')
                 {
                     depth--;
-                    if (depth == 0) return window.Substring(cursor - 1, dictEnd - (cursor - 1) + 2);
+                    if (depth == 0)
+                    {
+                        return DecodePdfNameEscapes(
+                            window.Substring(cursor - 1, dictEnd - (cursor - 1) + 2));
+                    }
                     cursor -= 2;
                     continue;
                 }
@@ -1815,6 +1866,51 @@ namespace SecureFileUpload.Services
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Resolves <c>#xx</c> hex escapes in a dictionary's text so token matching sees the
+        /// same spelling a PDF reader does.
+        /// </summary>
+        /// <remarks>
+        /// PDF 32000-1 §7.3.5 makes <c>/Obj#53tm</c> byte-for-byte equivalent to <c>/ObjStm</c>,
+        /// and every real reader resolves it. The document-level name extractor already decodes
+        /// escapes, so without this the two detectors disagreed on spelling: the document was
+        /// judged to declare an object stream while the stream itself classified as ordinary,
+        /// and every unscanned counter is gated on that classification. Writing the name escaped
+        /// therefore switched the whole gate off.
+        ///
+        /// Applied to the dictionary text only, which is used for token matching and never for
+        /// offsets, so changing its length is safe here.
+        /// </remarks>
+        private static string DecodePdfNameEscapes(string dict)
+        {
+            if (dict.IndexOf('#') < 0) return dict;
+
+            var sb = new StringBuilder(dict.Length);
+            for (int i = 0; i < dict.Length; i++)
+            {
+                if (dict[i] == '#' && i + 2 < dict.Length &&
+                    TryHexDigit(dict[i + 1], out int hi) && TryHexDigit(dict[i + 2], out int lo))
+                {
+                    sb.Append((char)((hi << 4) | lo));
+                    i += 2;
+                    continue;
+                }
+
+                sb.Append(dict[i]);
+            }
+
+            return sb.ToString();
+        }
+
+        private static bool TryHexDigit(char c, out int value)
+        {
+            if (c >= '0' && c <= '9') { value = c - '0'; return true; }
+            if (c >= 'a' && c <= 'f') { value = c - 'a' + 10; return true; }
+            if (c >= 'A' && c <= 'F') { value = c - 'A' + 10; return true; }
+            value = 0;
+            return false;
         }
 
         /// <summary>
@@ -1830,7 +1926,7 @@ namespace SecureFileUpload.Services
         {
             // No /Filter: the payload is stored literally. The scan loop reads those bytes
             // directly rather than attempting deflate, so this is inspectable.
-            if (!dict.Contains("/Filter", StringComparison.Ordinal)) return true;
+            if (!ContainsPdfName(dict, "Filter")) return true;
 
             foreach (string filter in UninflatableFilterNames)
             {
@@ -1844,7 +1940,7 @@ namespace SecureFileUpload.Services
             // graph, so treat anything not an inline dictionary as not inspectable.
             if (HasIndirectDecodeParms(dict)) return false;
 
-            if (dict.Contains("/Predictor", StringComparison.Ordinal) &&
+            if (ContainsPdfName(dict, "Predictor") &&
                 !IsIdentityPredictorOnly(dict))
             {
                 return false;
@@ -1896,7 +1992,7 @@ namespace SecureFileUpload.Services
             // strict stream a failure there counts as unscanned.
             if (dict is null) return true;
 
-            return dict.Contains("/Filter", StringComparison.Ordinal);
+            return ContainsPdfName(dict, "Filter");
         }
 
         /// <summary>

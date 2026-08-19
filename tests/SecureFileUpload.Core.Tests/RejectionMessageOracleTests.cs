@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using SecureFileUpload.Services;
+using System.Linq;
 using System.Text;
 using Xunit;
 
@@ -84,6 +85,12 @@ public sealed class RejectionMessageOracleTests
             Assert.False(string.IsNullOrWhiteSpace(message));
             Assert.Contains(message, CuratedMessages);
         }
+
+        // Adding an enum member without adding its string here would otherwise weaken every
+        // other test in this file, since they assert membership of CuratedMessages.
+        Assert.Equal(
+            Enum.GetValues<UploadRejectionMessageKey>().Length,
+            CuratedMessages.Distinct().Count());
     }
 
     private static readonly string[] CuratedMessages =
@@ -95,6 +102,8 @@ public sealed class RejectionMessageOracleTests
         UploadRejectionMessages.ImageTooLargeUploadSmaller,
         UploadRejectionMessages.ImageUnreadableRetake,
         UploadRejectionMessages.ImageRejectedGeneric,
+        UploadRejectionMessages.FileTooLargeUploadSmaller,
+        UploadRejectionMessages.FileEmpty,
     };
 
     private static async Task<ContentValidationResult> Validate(

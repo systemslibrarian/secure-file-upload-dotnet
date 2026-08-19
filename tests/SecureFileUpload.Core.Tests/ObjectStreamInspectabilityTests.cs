@@ -134,6 +134,50 @@ public sealed class ObjectStreamInspectabilityTests
         Assert.Equal(Uninspectable, result.ValidationType);
     }
 
+    [Theory]
+    [InlineData("/Obj#53tm")]      // #53 = 'S'
+    [InlineData("/ObjS#74m")]      // #74 = 't'
+    [InlineData("/#4FbjStm")]      // #4F = 'O'
+    public async Task Hex_escaped_object_stream_name_is_still_recognised(string escapedName)
+    {
+        // PDF 32000-1 §7.3.5: /Obj#53tm IS /ObjStm, and every real reader resolves it. The
+        // document-level name extractor already decoded escapes, so a stream-level check that
+        // did not disagreed with it — the document counted as declaring an object stream while
+        // the stream itself classified as ordinary, and every unscanned counter is gated on
+        // that classification. Writing the name escaped switched the entire gate off.
+        var result = await Validate(BuildPdf(
+            $"/Type {escapedName} /N 1 /First 4 /Filter /LZWDecode", Deflate(Filler())));
+
+        Assert.False(result.IsValid);
+        Assert.Equal(Uninspectable, result.ValidationType);
+    }
+
+    [Fact]
+    public async Task Hex_escaped_filter_name_does_not_slip_past_the_filter_check()
+    {
+        // Same trick applied to the filter rather than the type.
+        var result = await Validate(BuildPdf(
+            "/Type /ObjStm /N 1 /First 4 /Fil#74er /LZWDecode", Deflate(Filler())));
+
+        Assert.False(result.IsValid);
+        Assert.Equal(Uninspectable, result.ValidationType);
+    }
+
+    [Fact]
+    public async Task Unterminated_literal_string_cannot_hide_the_rest_of_the_document()
+    {
+        // An unclosed "(" made the lexer blank everything to EOF, so any declaration after it
+        // was invisible to every surface scan and its stream ranges were never recorded.
+        // Opening a bracket and never closing it was a complete bypass on its own.
+        string pdf = "%PDF-1.5\n1 0 obj\n<< /Title (unterminated >>\n" +
+                     "2 0 obj\n<< /Type /Action /S /Launch /F (calc.exe) >>\nendobj\n" +
+                     "trailer\n<<>>\n%%EOF\n";
+
+        var result = await Validate(Encoding.Latin1.GetBytes(pdf));
+
+        Assert.False(result.IsValid);
+    }
+
     // ── Negative cases: the gate must not fire on ordinary documents ─────────
     [Fact]
     public async Task Ordinary_flate_object_stream_passes()

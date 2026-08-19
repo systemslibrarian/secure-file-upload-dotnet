@@ -1435,52 +1435,89 @@ namespace SecureFileUpload.Services
         }
 
         /// <summary>
-        /// True when the buffer is an animated PNG or WebP, detected from container structure
-        /// rather than by decoding.
+        /// True when the buffer is an animated PNG or WebP, decided by walking container chunk
+        /// headers rather than by decoding.
         /// </summary>
         /// <remarks>
         /// Read from the bytes because <c>Image.Identify</c> reports canvas size only, and a
-        /// canvas-derived pixel cap does not bound a multi-frame decode. APNG announces itself
-        /// with an <c>acTL</c> chunk that must precede the first <c>IDAT</c>; animated WebP
-        /// carries an <c>ANIM</c> chunk in its RIFF container.
+        /// canvas-derived pixel cap does not bound a multi-frame decode.
+        ///
+        /// The walk follows the chunk table instead of searching the whole file for the tag. A
+        /// raw search matches those four bytes wherever they occur — including inside compressed
+        /// pixel data, where a given 4-byte sequence turns up by chance often enough to reject a
+        /// noticeable fraction of ordinary photographs.
         /// </remarks>
-        private static bool IsAnimatedContainer(byte[] bytes, string extension)
+        private static bool IsAnimatedContainer(byte[] bytes, string extension) => extension switch
         {
-            switch (extension)
-            {
-                case ".png":
-                    // acTL before IDAT is what makes a PNG animated; a later occurrence is not
-                    // a control chunk, so the search stops at the first IDAT.
-                    int idat = IndexOfAscii(bytes, "IDAT", 0);
-                    int limit = idat < 0 ? bytes.Length : idat;
-                    return IndexOfAscii(bytes, "acTL", 0, limit) >= 0;
+            ".png"  => PngHasAnimationControl(bytes),
+            ".webp" => WebpHasAnimationChunk(bytes),
+            _       => false,
+        };
 
-                case ".webp":
-                    // ANIM is the animation control chunk; ANMF frames follow it.
-                    return IndexOfAscii(bytes, "ANIM", 0) >= 0 ||
-                           IndexOfAscii(bytes, "ANMF", 0) >= 0;
-
-                default:
-                    return false;
-            }
-        }
-
-        /// <summary>Finds a four-character ASCII chunk tag in a byte buffer.</summary>
-        private static int IndexOfAscii(byte[] bytes, string tag, int start, int? end = null)
+        /// <summary>
+        /// Walks PNG chunks for an <c>acTL</c> before the first <c>IDAT</c> — what makes a PNG
+        /// an APNG.
+        /// </summary>
+        private static bool PngHasAnimationControl(byte[] bytes)
         {
-            int stop = Math.Min(end ?? bytes.Length, bytes.Length) - tag.Length;
-            for (int i = Math.Max(0, start); i <= stop; i++)
+            int pos = 8;   // PNG signature
+
+            // length(4) type(4) data(length) crc(4)
+            while (pos + 8 <= bytes.Length)
             {
-                bool match = true;
-                for (int j = 0; j < tag.Length; j++)
-                {
-                    if (bytes[i + j] != (byte)tag[j]) { match = false; break; }
-                }
-                if (match) return i;
+                uint length = ReadBigEndianUInt32(bytes, pos);
+                string type = ReadTag(bytes, pos + 4);
+
+                if (type == "acTL") return true;
+                if (type == "IDAT" || type == "IEND") return false;
+
+                long next = (long)pos + 8 + length + 4;
+                if (next <= pos || next > bytes.Length) return false;
+                pos = (int)next;
             }
 
-            return -1;
+            return false;
         }
+
+        /// <summary>Walks RIFF chunks for the WebP <c>ANIM</c> animation-control chunk.</summary>
+        private static bool WebpHasAnimationChunk(byte[] bytes)
+        {
+            // "RIFF" size(4) "WEBP", then chunks: fourCC(4) size(4) payload (padded to even).
+            if (bytes.Length < 12) return false;
+
+            int pos = 12;
+            while (pos + 8 <= bytes.Length)
+            {
+                string tag = ReadTag(bytes, pos);
+                uint size = ReadLittleEndianUInt32(bytes, pos + 4);
+
+                if (tag == "ANIM" || tag == "ANMF") return true;
+
+                long next = (long)pos + 8 + size + (size % 2);   // odd payloads are padded
+                if (next <= pos || next > bytes.Length) return false;
+                pos = (int)next;
+            }
+
+            return false;
+        }
+
+        private static string ReadTag(byte[] bytes, int offset)
+        {
+            if (offset + 4 > bytes.Length) return string.Empty;
+            return new string(new[]
+            {
+                (char)bytes[offset], (char)bytes[offset + 1],
+                (char)bytes[offset + 2], (char)bytes[offset + 3],
+            });
+        }
+
+        private static uint ReadBigEndianUInt32(byte[] bytes, int offset) =>
+            ((uint)bytes[offset] << 24) | ((uint)bytes[offset + 1] << 16) |
+            ((uint)bytes[offset + 2] << 8) | bytes[offset + 3];
+
+        private static uint ReadLittleEndianUInt32(byte[] bytes, int offset) =>
+            bytes[offset] | ((uint)bytes[offset + 1] << 8) |
+            ((uint)bytes[offset + 2] << 16) | ((uint)bytes[offset + 3] << 24);
 
         private async Task<byte[]> GetSanitizedPlaintextAsync(IFormFile file, string extension)
         {
