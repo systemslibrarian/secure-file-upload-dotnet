@@ -108,17 +108,36 @@ public sealed class ObjectStreamInspectabilityTests
     }
 
     [Fact]
-    public async Task Padding_the_dictionary_past_the_lookback_window_does_not_disarm_the_gate()
+    public async Task Padded_dictionary_with_unreadable_contents_is_rejected()
     {
-        // If the dictionary cannot be located, the stream is treated strictly rather than as
-        // ordinary — otherwise adding filler to a dictionary would switch the gate off, and
-        // the source ships with the package so the window size is not a secret.
+        // Padding the dictionary past the lookback window makes the stream unclassifiable.
+        // That must route it into the STRICT pass rather than quietly reclassifying it as
+        // ordinary — the source ships with the package, so the window size is not a secret.
+        // Here the payload also cannot be inflated, so the contents are genuinely unread.
         string padding = new string('P', 70_000);
+        var notDeflate = new byte[600];
+        Array.Fill(notDeflate, (byte)0xFF);
+
         var result = await Validate(BuildPdf(
-            $"/Type /ObjStm /N 1 /First 4 /Filter /LZWDecode /Producer ({padding})", Deflate(Filler())));
+            $"/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode /Producer ({padding})", notDeflate));
 
         Assert.False(result.IsValid);
         Assert.Equal(Uninspectable, result.ValidationType);
+    }
+
+    [Fact]
+    public async Task Padded_dictionary_whose_contents_DO_inflate_is_accepted()
+    {
+        // The invariant is "were the contents scanned", not "could the dictionary be parsed".
+        // An unreadable dictionary over a payload that inflates fine has been scanned, so
+        // rejecting it would be a false positive — the strict pass exists to guarantee the
+        // read happens, not to punish an unparsable header.
+        string padding = new string('P', 70_000);
+
+        var result = await Validate(BuildPdf(
+            $"/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode /Producer ({padding})", Deflate(Filler())));
+
+        Assert.NotEqual(Uninspectable, result.ValidationType);
     }
 
     [Fact]
