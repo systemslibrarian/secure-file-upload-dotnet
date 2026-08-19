@@ -77,6 +77,28 @@ namespace SecureFileUpload.Services
         public bool RejectPdfObjectStreams { get; set; } = false;
 
         /// <summary>
+        /// Reject a PDF object stream whose declared filter this validator cannot inflate,
+        /// rather than skipping it. Default <c>true</c> (fail closed).
+        /// </summary>
+        /// <remarks>
+        /// Object streams are accepted by default precisely because their contents are
+        /// inflated and scanned. That guarantee does not hold for a stream whose filter is
+        /// not FlateDecode (LZWDecode, ASCII85Decode, a Crypt filter, …) or whose
+        /// <c>/DecodeParms</c> declare a non-identity Predictor: inflation fails and the
+        /// payload inside is never examined. Skipping such a stream silently turns
+        /// "allowed because we inspect it" into "allowed, uninspected" — an attacker only
+        /// has to declare a filter the scanner cannot read.
+        ///
+        /// Only object streams are affected. Ordinary content streams that fail to inflate
+        /// are still skipped, because they are not the vector this guards and rejecting
+        /// them would fail legitimate documents.
+        ///
+        /// Set to false if you must accept PDFs from a producer that emits non-Flate object
+        /// streams; understand that their contents are then unscanned.
+        /// </remarks>
+        public bool RejectUninspectableObjectStreams { get; set; } = true;
+
+        /// <summary>
         /// When true, inflate the <c>stream … endstream</c> payloads that
         /// StripPdfStreamPayloads removed and re-run name-object extraction plus the dangerous
         /// pattern scan against the decompressed bytes. This is what makes
@@ -1443,6 +1465,26 @@ namespace SecureFileUpload.Services
 
                 state.StreamsInspected++;
 
+                // Gate BEFORE inflating, not in the catch below. Two distinct failure shapes
+                // need covering and only one of them throws: a non-Flate filter fails to
+                // inflate, but FlateDecode with a non-identity Predictor inflates *fine* and
+                // yields predictor-encoded bytes that get scanned as meaningless noise. Both
+                // leave an object stream's contents effectively unexamined, and object streams
+                // are accepted by default only on the promise that we examine them.
+                if (_options.RejectUninspectableObjectStreams &&
+                    IsUninspectableObjectStream(bytes, start))
+                {
+                    _logger.LogWarning(
+                        "SECURITY_EVENT | PDF_OBJECT_STREAM_UNINSPECTABLE | FileName: {FileName} | " +
+                        "Object stream declares a filter this validator cannot inflate; contents would go unscanned",
+                        fileName);
+                    return RejectPolicy(
+                        fileName, "PDF",
+                        "PDF object stream uses a filter that cannot be inspected.",
+                        "PDF-ObjectStreamUninspectable",
+                        UploadRejectionMessageKey.PdfUnreadableUploadImage);
+                }
+
                 // PDF FlateDecode is zlib-wrapped (RFC 1950) while DeflateStream speaks raw
                 // RFC 1951, so skip the 2-byte zlib header when one is present. Streams that
                 // are raw deflate (or another filter entirely) are still attempted and simply
@@ -1491,6 +1533,8 @@ namespace SecureFileUpload.Services
                 catch
                 {
                     // Malformed, encrypted, or non-Flate stream — nothing readable here.
+                    // Object streams that declare an uninspectable filter were already
+                    // rejected above, before inflation was attempted.
                     continue;
                 }
 
@@ -1549,6 +1593,171 @@ namespace SecureFileUpload.Services
         /// PDF stream, mirroring the checks <c>ValidatePdf</c> runs against the document surface
         /// so that hiding a declaration inside an object stream gains an attacker nothing.
         /// </summary>
+        /// <summary>
+        /// True when the stream whose data begins at <paramref name="dataStart"/> is a PDF
+        /// object stream (<c>/Type /ObjStm</c>) whose declared filter this validator cannot
+        /// inflate, so its contents would go unscanned.
+        /// </summary>
+        /// <remarks>
+        /// Only the stream's own dictionary is consulted, read backwards from the stream data
+        /// within a bounded window. Failing to locate the dictionary returns false: this gate
+        /// rejects on positive evidence of an uninspectable object stream, never on ambiguity,
+        /// so a parsing shortfall here cannot fail a legitimate document.
+        /// </remarks>
+        private static bool IsUninspectableObjectStream(byte[] bytes, int dataStart)
+        {
+            string? dict = ReadStreamDictionary(bytes, dataStart);
+            if (dict is null) return false;
+
+            // Only object streams are gated — see RejectUninspectableObjectStreams.
+            if (!ContainsPdfName(dict, "ObjStm")) return false;
+
+            return !IsInspectableFilter(dict);
+        }
+
+        /// <summary>
+        /// Reads the dictionary preceding a stream's data by scanning backwards from the
+        /// "stream" keyword to its opening "&lt;&lt;". Returns null when no plausible
+        /// dictionary is found within the lookback window.
+        /// </summary>
+        private static string? ReadStreamDictionary(byte[] bytes, int dataStart)
+        {
+            const int MaxLookback = 4096;
+
+            int windowStart = Math.Max(0, dataStart - MaxLookback);
+            int windowLen = dataStart - windowStart;
+            if (windowLen <= 4) return null;
+
+            string window = Encoding.Latin1.GetString(bytes, windowStart, windowLen);
+
+            // The dictionary closes immediately before the "stream" keyword.
+            int dictEnd = window.LastIndexOf(">>", StringComparison.Ordinal);
+            if (dictEnd < 0) return null;
+
+            // Walk backwards matching nesting depth. A naive LastIndexOf("<<") would stop at
+            // an INNER dictionary — /DecodeParms << /Predictor 12 >> is exactly the shape this
+            // gate cares about — and return a fragment with the outer /Filter missing, which
+            // reads as "no filter declared" and silently disarms the check.
+            int depth = 0;
+            // dictEnd indexes the FIRST '>' of ">>"; the scan below matches on the second,
+            // so start one to the right.
+            int cursor = dictEnd + 1;
+            while (cursor >= 1)
+            {
+                if (window[cursor] == '>' && window[cursor - 1] == '>')
+                {
+                    depth++;
+                    cursor -= 2;
+                    continue;
+                }
+
+                if (window[cursor] == '<' && window[cursor - 1] == '<')
+                {
+                    depth--;
+                    if (depth == 0) return window.Substring(cursor - 1, dictEnd - (cursor - 1) + 2);
+                    cursor -= 2;
+                    continue;
+                }
+
+                cursor--;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// True when every filter the dictionary declares is one this validator can actually
+        /// inflate. FlateDecode qualifies, but only with an identity Predictor: a non-identity
+        /// Predictor means the inflated bytes still need un-predicting before they are the
+        /// real content, which this scanner does not do.
+        /// </summary>
+        private static bool IsInspectableFilter(string dict)
+        {
+            // No filter at all: the data is stored literally and the scanner reads it fine.
+            if (!dict.Contains("/Filter", StringComparison.Ordinal)) return true;
+
+            // Any filter other than FlateDecode is outside what the inflater handles. Checking
+            // for the presence of a non-Flate filter name is deliberately conservative: an
+            // array like [/ASCII85Decode /FlateDecode] is treated as not inspectable, because
+            // the outer ASCII85 layer is not undone before inflation is attempted.
+            foreach (string filter in UninflatableFilterNames)
+            {
+                if (ContainsPdfName(dict, filter)) return false;
+            }
+
+            if (!ContainsPdfName(dict, "FlateDecode")) return false;
+
+            // FlateDecode with a non-identity Predictor: inflatable, but the result is not
+            // yet the content, so treat it as uninspectable rather than scanning noise.
+            if (dict.Contains("/Predictor", StringComparison.Ordinal) &&
+                !IsIdentityPredictorOnly(dict))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// True when every /Predictor value present is 1 (identity). PNG/TIFF predictors are
+        /// values 2 and 10-15.
+        /// </summary>
+        private static bool IsIdentityPredictorOnly(string dict)
+        {
+            int idx = 0;
+            while ((idx = dict.IndexOf("/Predictor", idx, StringComparison.Ordinal)) >= 0)
+            {
+                int cursor = idx + "/Predictor".Length;
+                while (cursor < dict.Length && char.IsWhiteSpace(dict[cursor])) cursor++;
+
+                int digitStart = cursor;
+                while (cursor < dict.Length && char.IsDigit(dict[cursor])) cursor++;
+
+                // No parsable value — treat as non-identity rather than assuming the safe case.
+                if (cursor == digitStart) return false;
+
+                if (!int.TryParse(dict.AsSpan(digitStart, cursor - digitStart), out int value) ||
+                    value != 1)
+                {
+                    return false;
+                }
+
+                idx = cursor;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Matches a PDF name token exactly, so "/ObjStm" does not match "/ObjStmExtra" and
+        /// "/FlateDecode" does not match a longer name that merely starts the same way.
+        /// </summary>
+        private static bool ContainsPdfName(string dict, string name)
+        {
+            int idx = 0;
+            while ((idx = dict.IndexOf("/" + name, idx, StringComparison.Ordinal)) >= 0)
+            {
+                int after = idx + name.Length + 1;
+                if (after >= dict.Length || !IsPdfNameChar(dict[after])) return true;
+                idx = after;
+            }
+
+            return false;
+        }
+
+        private static bool IsPdfNameChar(char c) =>
+            char.IsLetterOrDigit(c) || c == '.' || c == '-' || c == '_' || c == '#';
+
+        /// <summary>
+        /// Stream filters this validator cannot inflate. Their presence on an object stream
+        /// means its contents cannot be scanned.
+        /// </summary>
+        private static readonly string[] UninflatableFilterNames =
+        {
+            "LZWDecode", "ASCII85Decode", "ASCIIHexDecode", "RunLengthDecode",
+            "CCITTFaxDecode", "JBIG2Decode", "DCTDecode", "JPXDecode", "Crypt"
+        };
+
         private ContentValidationResult? ScanInflatedPdfNames(
             HashSet<string> names, string fileName, int depth)
         {
