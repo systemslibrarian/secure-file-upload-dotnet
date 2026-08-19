@@ -222,6 +222,26 @@ namespace SecureFileUpload.Services
             { ".pdf",  new byte[][] { new byte[] { 0x25, 0x50, 0x44, 0x46 } } }  // %PDF
         };
 
+        // Human-readable label used when a file is identified as an Apple/ISO HEIF image.
+        // Surfaced through DetectedAs so the caller can return a clear, actionable message
+        // instead of the generic "corrupted or malicious" wording. A HEIC upload is a
+        // compatibility problem, not an attack, and reporting it as one trains users to
+        // ignore the warning that does matter.
+        private const string HeicDetectedLabel = "Apple HEIC/HEIF image (unsupported)";
+
+        // ISO Base Media File Format "ftyp" brands identifying a HEIF/HEIC container — the
+        // format iPhones and iPads capture by default. Layout: [4-byte box size]["ftyp" at
+        // offset 4][4-byte major brand at offset 8]. These are routinely renamed or shared
+        // as .jpg/.jpeg, so detecting them explicitly explains the real problem.
+        private static readonly HashSet<string> HeifMajorBrands =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                "heic", "heix", "heis", "heim", // HEIC single image / sequence
+                "hevc", "hevx",                 // HEVC image sequence
+                "mif1", "msf1",                 // HEIF still image / sequence
+                "heif",                         // generic HEIF
+            };
+
         // Known dangerous magic bytes — used to identify what a disguised file actually is
         private static readonly Dictionary<string, string> KnownDangerousSignatures = new()
         {
@@ -845,6 +865,20 @@ namespace SecureFileUpload.Services
             var (magicOk, actualBytes, detectedAs) = ValidateFileSignatureDetailed(file, extension);
             if (!magicOk)
             {
+                if (detectedAs == HeicDetectedLabel)
+                {
+                    // Legitimate but unsupported image. Logged at Information, not as a
+                    // SECURITY_EVENT, so HEIC uploads do not pollute the security signal.
+                    _logger.LogInformation(
+                        "HEIC_UPLOAD_REJECTED | ClaimedExtension: {Ext} | ClaimedMime: {CT} | ActualBytes: {Bytes} | " +
+                        "Apple HEIF/HEIC image; unsupported format",
+                        extension, file.ContentType, actualBytes);
+                    return (false,
+                        "This looks like a HEIC image (the format iPhones and iPads capture by " +
+                        "default), which we cannot accept. Please re-save or export it as JPG, " +
+                        "PNG, or PDF and upload again.");
+                }
+
                 if (!string.IsNullOrEmpty(detectedAs))
                 {
                     _logger.LogWarning(
@@ -1515,6 +1549,11 @@ namespace SecureFileUpload.Services
                     }
                 }
 
+                // Not a known-dangerous signature — check whether this is an Apple/ISO
+                // HEIF/HEIC image so the caller can explain the real problem rather than
+                // implying the file is malicious.
+                detectedAs ??= IsHeifContainer(headerBytes) ? HeicDetectedLabel : null;
+
                 return (false, headerHex, detectedAs);
             }
             catch (Exception ex)
@@ -1522,6 +1561,29 @@ namespace SecureFileUpload.Services
                 _logger.LogError(ex, "MAGIC_BYTE_READ_ERROR");
                 return (false, "ERROR", null);
             }
+        }
+
+        /// <summary>
+        /// Detects an ISO Base Media File Format HEIF/HEIC container from its header bytes.
+        /// Layout: [4-byte box size][b'ftyp' at offset 4][4-byte major brand at offset 8].
+        /// Returns true when the "ftyp" box is present and the major brand is a known HEIF
+        /// brand, so the caller can tell the user to convert rather than implying malice.
+        /// </summary>
+        private static bool IsHeifContainer(byte[] headerBytes)
+        {
+            // Need the 4-byte size, "ftyp" (offsets 4-7), and the major brand (offsets 8-11).
+            if (headerBytes.Length < 12)
+                return false;
+
+            // "ftyp" box type at offset 4.
+            if (headerBytes[4] != 0x66 || headerBytes[5] != 0x74 ||
+                headerBytes[6] != 0x79 || headerBytes[7] != 0x70)
+            {
+                return false;
+            }
+
+            string majorBrand = Encoding.ASCII.GetString(headerBytes, 8, 4);
+            return HeifMajorBrands.Contains(majorBrand);
         }
 
         /// <summary>
