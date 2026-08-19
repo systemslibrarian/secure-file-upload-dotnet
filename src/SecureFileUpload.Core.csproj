@@ -19,16 +19,17 @@
 
     <!-- ── NuGet package metadata ─────────────────────────────────────── -->
     <PackageId>SecureFileUpload.Core</PackageId>
-    <Version>3.2.1</Version>
+    <Version>3.2.2</Version>
     <!--
-      AssemblyVersion deliberately held at 3.2.0.0. 3.2.1 is a documentation patch:
-      no IL changed, only comments, package metadata, and markdown. Holding the
-      assembly version makes this a drop-in upgrade from 3.2.0 with no
+      AssemblyVersion deliberately held at 3.2.0.0 across the whole 3.2.x line.
+      3.2.2 is a dependency-maintenance release: no .cs file changed, only the
+      ImageSharp patch floor and build/test tooling. Holding the assembly
+      version makes this a drop-in upgrade from 3.2.0 and 3.2.1 with no
       binding-redirect churn on frameworks that use them.
     -->
     <AssemblyVersion>3.2.0.0</AssemblyVersion>
-    <FileVersion>3.2.1.0</FileVersion>
-    <InformationalVersion>3.2.1</InformationalVersion>
+    <FileVersion>3.2.2.0</FileVersion>
+    <InformationalVersion>3.2.2</InformationalVersion>
     <Authors>Paul Clark (systemslibrarian)</Authors>
     <Company>systemslibrarian</Company>
     <Product>SecureFileUpload.Core</Product>
@@ -101,7 +102,7 @@ scanner that only existed here — neither side had both.
     interrupted write leaves no partial file. GetDecryptedFileStreamAsync
     enforces storage-root containment and rejects reparse points in any path
     component. Virus scan outcomes distinguish Disabled from Unavailable.
-  • SixLabors.ImageSharp pinned to [3.1.11,4.0.0): ImageSharp moved to a
+  • SixLabors.ImageSharp pinned to [3.1.12,4.0.0): ImageSharp moved to a
     commercial license at v4, which would push that obligation onto every
     consumer. The range still admits 3.1.x security patches.
   • No change to the 8-layer pipeline order, on-disk envelope formats,

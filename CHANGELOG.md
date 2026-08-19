@@ -3,8 +3,45 @@
 All notable changes to `SecureFileUpload.Core` are recorded here. The package
 follows semantic versioning. `AssemblyVersion` is held at `3.0.0.0` across the
 entire `3.0.x` line so patch releases are drop-in upgrades with no
-binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`, and
-`3.2.1` likewise holds at `3.2.0.0` because it changes no IL.
+binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`, and the
+whole `3.2.x` line holds at `3.2.0.0` because it changes no IL.
+
+## 3.2.2 — 2026-08-19 — Dependency maintenance
+
+No code, IL, or on-disk format change — no `.cs` file differs from `3.2.1`.
+`AssemblyVersion` stays at `3.2.0.0`, so this is a drop-in upgrade from any
+`3.2.x`.
+
+### Changed
+
+- **`SixLabors.ImageSharp` floor raised to `3.1.12`** (pin is now
+  `[3.1.12,4.0.0)`). This is the only change visible to consumers of the
+  package. The upper bound is unchanged and still deliberate: ImageSharp moved
+  to a commercial Six Labors license at v4, and shipping v4 would push that
+  obligation onto everyone who installs this package.
+- **Build and test tooling only, not shipped:** `Microsoft.SourceLink.GitHub`
+  `10.0.301` → `10.0.400` (`PrivateAssets="All"`), `Microsoft.NET.Test.Sdk`
+  `18.8.1` → `18.9.0`, `xunit.runner.visualstudio` `3.1.5` → `4.0.0`, and the
+  `Microsoft.Extensions.*` smoke-harness pins to `10.0.11`. The full suite
+  passes unchanged at 41 tests on `net8.0`, `net9.0`, and `net10.0`.
+
+### Fixed
+
+- **Stale ImageSharp version in the docs.** The README and the csproj header
+  comment both still described the pin as `[3.1.11,4.0.0)` after the floor
+  moved to `3.1.12`.
+
+### Repository
+
+Not part of the package, recorded for provenance: `.github/dependabot.yml` now
+groups the `Microsoft.Extensions.*` packages into a single pull request and
+ignores `semver-major` updates to `SixLabors.ImageSharp`. The grouping fixes a
+deadlock in which a lone `Microsoft.Extensions.Logging.Console` bump could
+never pass CI — it requires `Microsoft.Extensions.Configuration.Binder` at the
+same version, which its own single-package branch did not touch, so restore
+failed with `NU1605`. The ignore rule stops v4 from being re-proposed on every
+release while still admitting the `3.1.x` security patches that matter for a
+library fed attacker-controlled bytes.
 
 ## 3.2.1 — 2026-07-29 — Documentation patch
 
