@@ -10,8 +10,31 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    groups:
+      # The Microsoft.Extensions.* packages move in lockstep and depend on each
+      # other transitively. One PR per package deadlocks: bumping
+      # Logging.Console alone drags in Configuration.Binder >= the new version
+      # and trips NU1605 against the still-pinned Binder in its own PR. Grouped,
+      # they land together and the version graph stays consistent.
+      microsoft-extensions:
+        patterns:
+          - "Microsoft.Extensions.*"
+    ignore:
+      # ImageSharp v4 requires a paid Six Labors license and fails the build at
+      # restore time with "No Six Labors license found". The csproj pin is
+      # deliberately capped at [3.1.11,4.0.0) — major bumps are not actionable
+      # without buying a license. 3.x patches (the ones that carry security
+      # fixes) still come through.
+      - dependency-name: "SixLabors.ImageSharp"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # Workflow action bumps are low-risk and arrive in batches; one PR a week
+      # beats four.
+      github-actions:
+        patterns:
+          - "*"
