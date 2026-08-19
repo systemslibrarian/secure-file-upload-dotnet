@@ -85,6 +85,68 @@ public sealed class ImageDecodeCapTests
         Assert.Single(result.UploadedFilePaths);
     }
 
+    [Fact]
+    public async Task Animated_png_is_declined_before_decoding()
+    {
+        // A pixel cap read from the canvas does not bound a multi-frame decode: Image.LoadAsync
+        // materializes every frame, so peak memory is canvas x frames. A modest canvas with a
+        // hundred frames sits under the cap and still decodes to gigabytes. Detection is from
+        // the acTL container chunk, so no decode happens to find out.
+        var result = await UploadAsync(ApngBytes(), "anim.png", "image/png");
+
+        Assert.False(result.Success);
+        Assert.Single(result.Errors);
+        Assert.Contains("could not be safely processed", result.Errors[0], StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Still_png_is_not_mistaken_for_an_animation()
+    {
+        // Guard against the detection firing on ordinary PNGs — that would reject most uploads.
+        var result = await UploadAsync(SmallPng(), "still.png", "image/png");
+
+        Assert.True(result.Success, result.Errors.Count > 0 ? result.Errors[0] : "no error reported");
+    }
+
+    /// <summary>
+    /// A still PNG with an acTL animation-control chunk spliced in ahead of IDAT — the marker
+    /// that makes a PNG an APNG.
+    /// </summary>
+    private static byte[] ApngBytes()
+    {
+        byte[] png = SmallPng();
+        int idat = IndexOf(png, "IDAT");
+        Assert.True(idat > 0, "test PNG has no IDAT chunk");
+
+        // Chunk layout: 4-byte length, 4-byte type, data, 4-byte CRC. The validator and the
+        // detector both read structure, not CRCs, so a structurally-placed chunk suffices.
+        var actl = new List<byte> { 0, 0, 0, 8 };
+        actl.AddRange(Encoding.ASCII.GetBytes("acTL"));
+        actl.AddRange(new byte[] { 0, 0, 0, 100, 0, 0, 0, 0 });   // 100 frames, infinite loops
+        actl.AddRange(new byte[] { 0, 0, 0, 0 });                  // CRC placeholder
+
+        int insertAt = idat - 4;   // before IDAT's length field
+        var outBytes = new List<byte>(png.Length + actl.Count);
+        outBytes.AddRange(png[..insertAt]);
+        outBytes.AddRange(actl);
+        outBytes.AddRange(png[insertAt..]);
+        return outBytes.ToArray();
+    }
+
+    private static int IndexOf(byte[] haystack, string needle)
+    {
+        for (int i = 0; i <= haystack.Length - needle.Length; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < needle.Length; j++)
+            {
+                if (haystack[i + j] != (byte)needle[j]) { match = false; break; }
+            }
+            if (match) return i;
+        }
+        return -1;
+    }
+
     private static byte[] SmallPng()
     {
         using var image = new Image<Rgba32>(50, 50);

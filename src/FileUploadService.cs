@@ -893,17 +893,24 @@ namespace SecureFileUpload.Services
             }
 
             // -- Layer 4: Magic bytes check -----------------------------------
-            var (magicOk, actualBytes, detectedAs) = ValidateFileSignatureDetailed(file, extension);
+            var (magicOk, actualBytes, detectedAs, isHeif) = ValidateFileSignatureDetailed(file, extension);
             if (!magicOk)
             {
-                if (detectedAs == HeicDetectedLabel)
+                if (isHeif)
                 {
-                    // Legitimate but unsupported image. Logged at Information, not as a
-                    // SECURITY_EVENT, so HEIC uploads do not pollute the security signal.
-                    _logger.LogInformation(
-                        "HEIC_UPLOAD_REJECTED | ClaimedExtension: {Ext} | ClaimedMime: {CT} | ActualBytes: {Bytes} | " +
-                        "Apple HEIF/HEIC image; unsupported format",
-                        extension, file.ContentType, actualBytes);
+                    // A HEIC upload is a compatibility problem, not an attack, so the USER gets
+                    // an actionable message instead of a malware accusation.
+                    //
+                    // The SECURITY_EVENT warning below still fires, though. Suppressing it here
+                    // would let an attacker prepend twelve bytes of HEIF ftyp header to every
+                    // probe and drop the whole magic-byte-mismatch signal to Information —
+                    // blinding any alert rule keyed on SECURITY_EVENT while still learning
+                    // exactly which payloads are rejected. The log stays loud; only the
+                    // user-facing wording changes.
+                    _logger.LogWarning(
+                        "SECURITY_EVENT | MAGIC_BYTE_MISMATCH | ClaimedExtension: {Ext} | ClaimedMime: {CT} | ActualBytes: {Bytes} | " +
+                        "DetectedAs: {Detected} | HEIC_UPLOAD_REJECTED | Apple HEIF/HEIC image; unsupported format",
+                        extension, file.ContentType, actualBytes, detectedAs);
                     return (false,
                         "This looks like a HEIC image (the format iPhones and iPads capture by " +
                         "default), which we cannot accept. Please re-save or export it as JPG, " +
@@ -1401,6 +1408,80 @@ namespace SecureFileUpload.Services
         ///     validated bytes. Only choose this if false rejections of unusual but
         ///     legitimate camera output matter more than the polyglot-tail guarantee.
         /// </summary>
+        /// <summary>
+        /// Applies <c>FileUpload:RejectOnRecompressFailure</c> to an image this service has
+        /// declined to decode. Rejecting throws <see cref="ImageSanitizationException"/>;
+        /// otherwise the original validated bytes are stored undecoded.
+        /// </summary>
+        /// <remarks>
+        /// No decode happens on either branch, so the memory bound holds regardless — the flag
+        /// only decides whether the unsanitized original is kept. Every "cannot sanitize this
+        /// image" path routes through here so they cannot drift apart again.
+        /// </remarks>
+        private byte[] HandleUndecodableImage(byte[] original, string extension, string reason)
+        {
+            if (_rejectOnRecompressFailure)
+            {
+                CryptographicOperations.ZeroMemory(original);
+                throw new ImageSanitizationException(reason);
+            }
+
+            _logger.LogWarning(
+                "SECURITY_EVENT | IMAGE_NOT_SANITIZED_FALLBACK | Ext: {Ext} | Reason: {Reason} | " +
+                "Storing original validated bytes undecoded (FileUpload:RejectOnRecompressFailure=false). " +
+                "Any data appended after the image's structural end is preserved on disk.",
+                extension, reason);
+            return original;
+        }
+
+        /// <summary>
+        /// True when the buffer is an animated PNG or WebP, detected from container structure
+        /// rather than by decoding.
+        /// </summary>
+        /// <remarks>
+        /// Read from the bytes because <c>Image.Identify</c> reports canvas size only, and a
+        /// canvas-derived pixel cap does not bound a multi-frame decode. APNG announces itself
+        /// with an <c>acTL</c> chunk that must precede the first <c>IDAT</c>; animated WebP
+        /// carries an <c>ANIM</c> chunk in its RIFF container.
+        /// </remarks>
+        private static bool IsAnimatedContainer(byte[] bytes, string extension)
+        {
+            switch (extension)
+            {
+                case ".png":
+                    // acTL before IDAT is what makes a PNG animated; a later occurrence is not
+                    // a control chunk, so the search stops at the first IDAT.
+                    int idat = IndexOfAscii(bytes, "IDAT", 0);
+                    int limit = idat < 0 ? bytes.Length : idat;
+                    return IndexOfAscii(bytes, "acTL", 0, limit) >= 0;
+
+                case ".webp":
+                    // ANIM is the animation control chunk; ANMF frames follow it.
+                    return IndexOfAscii(bytes, "ANIM", 0) >= 0 ||
+                           IndexOfAscii(bytes, "ANMF", 0) >= 0;
+
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>Finds a four-character ASCII chunk tag in a byte buffer.</summary>
+        private static int IndexOfAscii(byte[] bytes, string tag, int start, int? end = null)
+        {
+            int stop = Math.Min(end ?? bytes.Length, bytes.Length) - tag.Length;
+            for (int i = Math.Max(0, start); i <= stop; i++)
+            {
+                bool match = true;
+                for (int j = 0; j < tag.Length; j++)
+                {
+                    if (bytes[i + j] != (byte)tag[j]) { match = false; break; }
+                }
+                if (match) return i;
+            }
+
+            return -1;
+        }
+
         private async Task<byte[]> GetSanitizedPlaintextAsync(IFormFile file, string extension)
         {
             using var ms = new MemoryStream(checked((int)Math.Min(file.Length, int.MaxValue)));
@@ -1424,40 +1505,58 @@ namespace SecureFileUpload.Services
                 var info = Image.Identify(probeMs);
                 declaredPixels = (long)info.Width * info.Height;
             }
+            catch (OperationCanceledException)
+            {
+                // Never convert a cancellation into a security rejection.
+                throw;
+            }
             catch (Exception ex)
             {
-                CryptographicOperations.ZeroMemory(original);
-                throw new ImageSanitizationException(
-                    "Image dimensions could not be read before re-encoding.", ex);
+                // Same flag as every other "cannot sanitize this image" path. Hard-rejecting
+                // here regardless would break the documented store-the-original fallback for
+                // operators who have deliberately turned rejection off.
+                if (_rejectOnRecompressFailure)
+                {
+                    CryptographicOperations.ZeroMemory(original);
+                    throw new ImageSanitizationException(
+                        "Image dimensions could not be read before re-encoding.", ex);
+                }
+
+                _logger.LogWarning(ex,
+                    "SECURITY_EVENT | IMAGE_IDENTIFY_FAILED_FALLBACK | Ext: {Ext} | " +
+                    "Storing original validated bytes (FileUpload:RejectOnRecompressFailure=false).",
+                    extension);
+                return original;
             }
 
             bool isJpeg = extension == ".jpg" || extension == ".jpeg";
             long decodeCap = isJpeg ? _maxReencodeDecodePixels : _maxNonJpegDecodePixels;
 
+            // A pixel cap computed from the canvas alone does not bound an ANIMATED container:
+            // Image.LoadAsync materializes every frame, so peak memory is canvas x frames. A
+            // 16 MP APNG or animated WebP with 100 frames sits under a 24 MP cap and still
+            // decodes to gigabytes. Animation has no place in a document upload, so these are
+            // declined outright rather than given a frame-scaled budget.
+            if (!isJpeg && IsAnimatedContainer(original, extension))
+            {
+                _logger.LogWarning(
+                    "SECURITY_EVENT | IMAGE_ANIMATED_CONTAINER | Ext: {Ext} | DeclaredPixels: {Pixels:N0} | " +
+                    "Multi-frame image declined before decoding; peak memory is canvas x frames",
+                    extension, declaredPixels);
+                return HandleUndecodableImage(
+                    original, extension,
+                    $"Animated {extension.TrimStart('.').ToUpperInvariant()} declined: peak decode memory scales with frame count.");
+            }
+
             if (declaredPixels > decodeCap)
             {
-                // Over the cap we decline to decode. That is the same situation
-                // RejectOnRecompressFailure already governs — "we cannot sanitize this
-                // image, now what" — so it is honoured here rather than hard-rejecting.
-                // Either way no decode happens, so the memory bound holds in both branches;
-                // the flag only decides whether the unsanitized original is stored.
-                if (_rejectOnRecompressFailure)
-                {
-                    _logger.LogWarning(
-                        "SECURITY_EVENT | IMAGE_DECODE_CAP_EXCEEDED_REJECTED | Ext: {Ext} | DeclaredPixels: {Pixels:N0} | Cap: {Cap:N0} | " +
-                        "Refused before decoding to bound peak memory (FileUpload:RejectOnRecompressFailure=true).",
-                        extension, declaredPixels, decodeCap);
-                    CryptographicOperations.ZeroMemory(original);
-                    throw new ImageSanitizationException(
-                        $"Image declares {declaredPixels:N0} pixels, above the {decodeCap:N0} decode cap.");
-                }
-
                 _logger.LogWarning(
-                    "SECURITY_EVENT | IMAGE_DECODE_CAP_EXCEEDED_FALLBACK | Ext: {Ext} | DeclaredPixels: {Pixels:N0} | Cap: {Cap:N0} | " +
-                    "Storing original validated bytes undecoded (FileUpload:RejectOnRecompressFailure=false). " +
-                    "Any data appended after the image's structural end is preserved on disk.",
+                    "SECURITY_EVENT | IMAGE_DECODE_CAP_EXCEEDED | Ext: {Ext} | DeclaredPixels: {Pixels:N0} | Cap: {Cap:N0} | " +
+                    "Refused before decoding to bound peak memory",
                     extension, declaredPixels, decodeCap);
-                return original;
+                return HandleUndecodableImage(
+                    original, extension,
+                    $"Image declares {declaredPixels:N0} pixels, above the {decodeCap:N0} decode cap.");
             }
 
             // Bound concurrent decodes process-wide. Without this, R concurrent uploads each
@@ -1577,11 +1676,11 @@ namespace SecureFileUpload.Services
         /// identification of what the file really is (if it doesn't match the claimed type).
         /// For WebP, additionally validates the WEBP fourCC at offset 8.
         /// </summary>
-        private (bool IsValid, string ActualBytesHex, string? DetectedAs) ValidateFileSignatureDetailed(
+        private (bool IsValid, string ActualBytesHex, string? DetectedAs, bool IsHeif) ValidateFileSignatureDetailed(
             IFormFile file, string extension)
         {
             if (!FileSignatures.TryGetValue(extension, out var signatures))
-                return (false, string.Empty, "No signature defined — fail closed");
+                return (false, string.Empty, "No signature defined — fail closed", false);
 
             try
             {
@@ -1633,17 +1732,18 @@ namespace SecureFileUpload.Services
                     }
                 }
 
-                // Not a known-dangerous signature — check whether this is an Apple/ISO
-                // HEIF/HEIC image so the caller can explain the real problem rather than
-                // implying the file is malicious.
-                detectedAs ??= IsHeifContainer(headerBytes) ? HeicDetectedLabel : null;
+                // Classify HEIF separately from the display label. Returning a flag rather than
+                // having the caller string-match on presentation text means rewording the label
+                // cannot silently disable the branch.
+                bool isHeif = IsHeifContainer(headerBytes);
+                detectedAs ??= isHeif ? HeicDetectedLabel : null;
 
-                return (false, headerHex, detectedAs);
+                return (false, headerHex, detectedAs, isHeif);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "MAGIC_BYTE_READ_ERROR");
-                return (false, "ERROR", null);
+                return (false, "ERROR", null, false);
             }
         }
 

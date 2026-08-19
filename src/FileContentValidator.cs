@@ -211,7 +211,13 @@ namespace SecureFileUpload.Services
         ImageUnreadableRetake,
 
         /// <summary>An image was rejected with no more specific guidance available.</summary>
-        ImageRejectedGeneric
+        ImageRejectedGeneric,
+
+        /// <summary>The file exceeds a size limit. Its own size is not a secret.</summary>
+        FileTooLargeUploadSmaller,
+
+        /// <summary>The file was empty or absent.</summary>
+        FileEmpty
     }
 
     /// <summary>
@@ -228,38 +234,52 @@ namespace SecureFileUpload.Services
     /// </remarks>
     public static class UploadRejectionMessages
     {
+        // Deliberately static readonly rather than const. A const on a public type in a
+        // published package is inlined into every consumer at compile time, so a later wording
+        // fix never reaches assemblies already built against it — a consumer comparing against
+        // the constant would silently stop matching what Resolve() returns.
+
         /// <summary>Shared generic. Names no gate, so distinct reasons collapse to one string.</summary>
-        public const string FileRejectedGeneric =
+        public static readonly string FileRejectedGeneric =
             "We could not accept this file. Please upload a clear image (JPG, PNG, or WebP) " +
             "or a standard PDF, and try again.";
 
         /// <summary>PDF blocked by a dangerous-pattern rule. Reveals no detection detail.</summary>
-        public const string PdfSecurityUploadImageInstead =
+        public static readonly string PdfSecurityUploadImageInstead =
             "This PDF was rejected for security reasons. Please upload an image (JPG or PNG) " +
             "instead of a PDF and try again.";
 
         /// <summary>Every structural or policy PDF gate resolves here. Detail stays in the log.</summary>
-        public const string PdfUnreadableUploadImage =
+        public static readonly string PdfUnreadableUploadImage =
             "We could not process this PDF. Please upload an image (JPG or PNG) of the " +
             "document instead of a PDF, and try again.";
 
         /// <summary>Password-protected PDF, an actionable case.</summary>
-        public const string PdfEncryptedRemovePassword =
+        public static readonly string PdfEncryptedRemovePassword =
             "This PDF is password-protected, so we cannot open it. Please remove the password " +
             "and upload it again, or upload an image (JPG or PNG) instead.";
 
         /// <summary>Size rejections. No dimensions or pixel counts appear here.</summary>
-        public const string ImageTooLargeUploadSmaller =
+        public static readonly string ImageTooLargeUploadSmaller =
             "This image is too large for us to process. Please upload a smaller or " +
             "lower-resolution image and try again.";
 
         /// <summary>Decode failures. Never includes the exception type or file name.</summary>
-        public const string ImageUnreadableRetake =
+        public static readonly string ImageUnreadableRetake =
             "We could not read this image. Please re-capture or re-export it and upload it " +
             "again, making sure the file finishes uploading.";
 
+        /// <summary>Size rejections at the file level. Actionable, and the uploader already
+        /// knows how big their own file is, so this discloses nothing.</summary>
+        public static readonly string FileTooLargeUploadSmaller =
+            "This file is too large for us to process. Please upload a smaller file and try again.";
+
+        /// <summary>Empty or absent file — trivially observable by the uploader.</summary>
+        public static readonly string FileEmpty =
+            "This file appears to be empty. Please check the file and upload it again.";
+
         /// <summary>Curated fallback for image gates with no more specific guidance.</summary>
-        public const string ImageRejectedGeneric =
+        public static readonly string ImageRejectedGeneric =
             "We could not accept this image. Please upload a clear image (JPG, PNG, or WebP) " +
             "and try again.";
 
@@ -272,6 +292,8 @@ namespace SecureFileUpload.Services
             UploadRejectionMessageKey.ImageTooLargeUploadSmaller => ImageTooLargeUploadSmaller,
             UploadRejectionMessageKey.ImageUnreadableRetake => ImageUnreadableRetake,
             UploadRejectionMessageKey.ImageRejectedGeneric => ImageRejectedGeneric,
+            UploadRejectionMessageKey.FileTooLargeUploadSmaller => FileTooLargeUploadSmaller,
+            UploadRejectionMessageKey.FileEmpty => FileEmpty,
             _ => FileRejectedGeneric
         };
     }
@@ -596,10 +618,12 @@ namespace SecureFileUpload.Services
             CancellationToken cancellationToken = default)
         {
             if (file is null)
-                return RejectStructural("(null)", "INPUT", "No file was provided.", "Input-Null");
+                return RejectStructural("(null)", "INPUT", "No file was provided.", "Input-Null",
+                    UploadRejectionMessageKey.FileEmpty);
 
             if (file.Length <= 0)
-                return RejectStructural(SanitizeFileName(file.FileName), "INPUT", "The file is empty.", "Input-Empty");
+                return RejectStructural(SanitizeFileName(file.FileName), "INPUT", "The file is empty.", "Input-Empty",
+                    UploadRejectionMessageKey.FileEmpty);
 
             string safeFileName = SanitizeFileName(file.FileName);
 
@@ -609,7 +633,8 @@ namespace SecureFileUpload.Services
                     safeFileName,
                     "INPUT",
                     $"File exceeds deep-scan limit of {_options.MaxDeepScanBytes:N0} bytes.",
-                    "FailClosed-SizeLimit");
+                    "FailClosed-SizeLimit",
+                    UploadRejectionMessageKey.FileTooLargeUploadSmaller);
 
             string extension = Path.GetExtension(file.FileName)?.ToLowerInvariant() ?? string.Empty;
 
@@ -1353,7 +1378,8 @@ namespace SecureFileUpload.Services
             if (streamRanges is { Count: > 0 })
             {
                 if (ScanCompressedPdfStreams(
-                        bytes, streamRanges, fileName, cancellationToken) is { } streamThreat)
+                        bytes, streamRanges, fileName, dictContent,
+                        pdfNames.Contains("ObjStm"), cancellationToken) is { } streamThreat)
                     return streamThreat;
             }
 
@@ -1398,32 +1424,70 @@ namespace SecureFileUpload.Services
             public int RatioCap;
             public int MaxStreams;
             public int MaxDecompressedBytes;
+
+            /// <summary>Surface with strings, comments and stream payloads blanked, 1:1 offsets.</summary>
+            public string DictContent = string.Empty;
+
+            /// <summary>True when the document surface declares /ObjStm anywhere.</summary>
+            public bool DocumentDeclaresObjStm;
+
+            /// <summary>Object streams whose contents could not be read and therefore not scanned.</summary>
+            public int ObjStmUnscanned;
+
+            /// <summary>Set when a budget or cap ended the ordinary-stream walk early.</summary>
+            public bool OrdinaryScanTruncated;
         }
 
         private ContentValidationResult? ScanCompressedPdfStreams(
             byte[] bytes,
             List<(int Start, int End)> streamRanges,
             string fileName,
+            string dictContent,
+            bool documentDeclaresObjStm,
             CancellationToken cancellationToken)
         {
             var state = new PdfStreamScanState
             {
-                TimeoutMs            = _options.MaxPdfStreamScanMilliseconds,
-                RatioCap             = _options.MaxDecompressionRatio,
-                MaxStreams           = _options.MaxCompressedStreamsToInspect,
-                MaxDecompressedBytes = _options.MaxDecompressedStreamBytes,
+                TimeoutMs                = _options.MaxPdfStreamScanMilliseconds,
+                RatioCap                 = _options.MaxDecompressionRatio,
+                MaxStreams               = _options.MaxCompressedStreamsToInspect,
+                MaxDecompressedBytes     = _options.MaxDecompressedStreamBytes,
+                DictContent              = dictContent,
+                DocumentDeclaresObjStm   = documentDeclaresObjStm,
             };
             state.Deadline.Start();
 
             var result = ScanCompressedPdfStreamsCore(
                 bytes, streamRanges, fileName, depth: 0, state, cancellationToken);
 
+            // Fail closed on the PROMISE, not on the declaration. Object streams are accepted
+            // by default only because their contents get scanned; if any object stream's
+            // contents were not actually read — wrong filter, bytes that do not inflate despite
+            // declaring /FlateDecode, an unreadable dictionary — that promise was not kept and
+            // the file must not be accepted on the strength of it.
+            if (result is null &&
+                _options.RejectUninspectableObjectStreams &&
+                documentDeclaresObjStm &&
+                state.ObjStmUnscanned > 0)
+            {
+                _logger.LogWarning(
+                    "SECURITY_EVENT | PDF_OBJECT_STREAM_UNINSPECTABLE | FileName: {FileName} | " +
+                    "Unscanned object streams: {Count} | Contents could not be read, so the " +
+                    "document surface is incomplete",
+                    fileName, state.ObjStmUnscanned);
+                result = RejectPolicy(
+                    fileName, "PDF",
+                    $"PDF object stream contents could not be inspected ({state.ObjStmUnscanned} unscanned).",
+                    "PDF-ObjectStreamUninspectable",
+                    UploadRejectionMessageKey.PdfUnreadableUploadImage);
+            }
+
             if (state.StreamsInspected > 0)
                 _logger.LogDebug(
                     "PDF_COMPRESSED_STREAMS_SCANNED | FileName: {FileName} | Streams: {Count} | " +
-                    "DecompressedBytes: {Bytes} | ElapsedMs: {Ms}",
+                    "DecompressedBytes: {Bytes} | ElapsedMs: {Ms} | OrdinaryScanTruncated: {Truncated}",
                     fileName, state.StreamsInspected, state.TotalDecompressed,
-                    state.Deadline.ElapsedMilliseconds);
+                    state.Deadline.ElapsedMilliseconds, state.OrdinaryScanTruncated);
 
             return result;
         }
@@ -1439,10 +1503,52 @@ namespace SecureFileUpload.Services
             if (depth > _options.MaxPdfStreamRecursionDepth)
                 return null;
 
+            // Object streams are walked FIRST, in their own pass, exempt from the ordinary
+            // per-file stream cap. Sharing one budget let an attacker park 64 tiny decoy
+            // streams ahead of the payload so the loop broke before the object stream was ever
+            // examined — the gate failed open under an entirely attacker-controlled condition.
+            //
+            // Streams whose dictionary cannot be read join the strict pass when the document
+            // declares /ObjStm, so padding a dictionary past the lookback window does not
+            // quietly reclassify a stream as ordinary.
+            var strictRanges = new List<(int Start, int End, PdfStreamKind Kind)>();
+            var ordinaryRanges = new List<(int Start, int End, PdfStreamKind Kind)>();
+
             foreach ((int start, int end) in streamRanges)
             {
-                if (state.StreamsInspected >= state.MaxStreams) break;
-                if (state.TotalDecompressed >= state.MaxDecompressedBytes) break;
+                // Classification only matters when the document declares /ObjStm; skipping it
+                // otherwise keeps ordinary PDFs off the dictionary-reading path entirely.
+                PdfStreamKind kind = state.DocumentDeclaresObjStm
+                    ? ClassifyStream(state.DictContent, start)
+                    : PdfStreamKind.Ordinary;
+
+                if (kind == PdfStreamKind.Ordinary) ordinaryRanges.Add((start, end, kind));
+                else strictRanges.Add((start, end, kind));
+            }
+
+            // Strict first, then ordinary. Built explicitly rather than with Concat so this
+            // file carries no LINQ dependency.
+            var orderedRanges = new List<(int Start, int End, PdfStreamKind Kind)>(
+                strictRanges.Count + ordinaryRanges.Count);
+            orderedRanges.AddRange(strictRanges);
+            orderedRanges.AddRange(ordinaryRanges);
+
+            foreach ((int start, int end, PdfStreamKind kind) in orderedRanges)
+            {
+                bool strict = kind != PdfStreamKind.Ordinary;
+
+                // Caps bound the ORDINARY walk only. A strict stream is never skipped for
+                // budget: it is either scanned or counted as unscanned, and unscanned rejects.
+                if (!strict && state.StreamsInspected >= state.MaxStreams)
+                {
+                    state.OrdinaryScanTruncated = true;
+                    break;
+                }
+                if (!strict && state.TotalDecompressed >= state.MaxDecompressedBytes)
+                {
+                    state.OrdinaryScanTruncated = true;
+                    break;
+                }
 
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -1460,29 +1566,25 @@ namespace SecureFileUpload.Services
 
                 // Offsets come from a Latin1 decode of these same bytes, so they map 1:1.
                 // Clamp defensively anyway rather than trusting the invariant.
-                if (start < 0 || end > bytes.Length || end - start <= 2) continue;
+                if (start < 0 || end > bytes.Length || end - start <= 2)
+                {
+                    // Degenerate or out-of-range span. Nothing to read either way, but for an
+                    // object stream "nothing was read" is the condition that must fail closed.
+                    if (strict) state.ObjStmUnscanned++;
+                    continue;
+                }
                 int rawLen = end - start;
 
                 state.StreamsInspected++;
 
-                // Gate BEFORE inflating, not in the catch below. Two distinct failure shapes
-                // need covering and only one of them throws: a non-Flate filter fails to
-                // inflate, but FlateDecode with a non-identity Predictor inflates *fine* and
-                // yields predictor-encoded bytes that get scanned as meaningless noise. Both
-                // leave an object stream's contents effectively unexamined, and object streams
-                // are accepted by default only on the promise that we examine them.
-                if (_options.RejectUninspectableObjectStreams &&
-                    IsUninspectableObjectStream(bytes, start))
+                // A declared filter we cannot inflate is settled here: the bytes will never be
+                // readable, so there is nothing to attempt. FlateDecode with a non-identity
+                // Predictor lands here too — it inflates fine, but the output is still
+                // predictor-encoded and scanning it would just be scanning noise.
+                if (kind == PdfStreamKind.ObjectStreamUninspectable)
                 {
-                    _logger.LogWarning(
-                        "SECURITY_EVENT | PDF_OBJECT_STREAM_UNINSPECTABLE | FileName: {FileName} | " +
-                        "Object stream declares a filter this validator cannot inflate; contents would go unscanned",
-                        fileName);
-                    return RejectPolicy(
-                        fileName, "PDF",
-                        "PDF object stream uses a filter that cannot be inspected.",
-                        "PDF-ObjectStreamUninspectable",
-                        UploadRejectionMessageKey.PdfUnreadableUploadImage);
+                    state.ObjStmUnscanned++;
+                    continue;
                 }
 
                 // PDF FlateDecode is zlib-wrapped (RFC 1950) while DeflateStream speaks raw
@@ -1494,51 +1596,87 @@ namespace SecureFileUpload.Services
                 bool looksLikeZlib = (b0 & 0x0F) == 0x08 && (((b0 << 8) | b1) % 31 == 0);
                 int deflateOffset = looksLikeZlib ? 2 : 0;
                 int deflateLen = rawLen - deflateOffset;
-                if (deflateLen <= 0) continue;
-
-                int budget = state.MaxDecompressedBytes - state.TotalDecompressed;
-                if (budget <= 0) break;
-
-                byte[] inflated;
-                try
+                if (deflateLen <= 0)
                 {
-                    using var src = new MemoryStream(bytes, start + deflateOffset, deflateLen, writable: false);
-                    using var inflater = new DeflateStream(src, CompressionMode.Decompress, leaveOpen: false);
-                    using var dst = new MemoryStream();
-                    var buf = new byte[8192];
-                    int read;
-                    int written = 0;
-                    while ((read = inflater.Read(buf, 0, buf.Length)) > 0)
-                    {
-                        written += read;
-                        if (written > budget)
-                        {
-                            // Over the per-file budget: keep what fits and stop this stream.
-                            dst.Write(buf, 0, read - (written - budget));
-                            break;
-                        }
-                        dst.Write(buf, 0, read);
-
-                        // Re-check the wall-clock and cancellation budgets while streaming —
-                        // a single huge inflate must not block past the cap.
-                        cancellationToken.ThrowIfCancellationRequested();
-                        if (state.Deadline.ElapsedMilliseconds > state.TimeoutMs) break;
-                    }
-                    inflated = dst.ToArray();
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch
-                {
-                    // Malformed, encrypted, or non-Flate stream — nothing readable here.
-                    // Object streams that declare an uninspectable filter were already
-                    // rejected above, before inflation was attempted.
+                    if (strict) state.ObjStmUnscanned++;
                     continue;
                 }
 
-                if (inflated.Length == 0) continue;
+                int budget = state.MaxDecompressedBytes - state.TotalDecompressed;
+                if (budget <= 0)
+                {
+                    // Ordinary streams stop here. A strict stream must not: dropping it for
+                    // budget is the same fail-open shape as the stream-count cap, reached by a
+                    // different counter, so it is recorded as unscanned and the file refused.
+                    if (strict) { state.ObjStmUnscanned++; continue; }
+                    state.OrdinaryScanTruncated = true;
+                    break;
+                }
+
+                byte[] inflated;
+
+                // An object stream with no /Filter is stored literally: its bytes ARE the
+                // content. Deflate would throw on them and the catch would then record a
+                // false "unscanned", so take them as-is and let the identical downstream
+                // name-extraction, ratio check and nested recursion run over them.
+                if (strict && !DeclaresAnyFilter(state.DictContent, start))
+                {
+                    inflated = new byte[rawLen];
+                    Array.Copy(bytes, start, inflated, 0, rawLen);
+                    deflateLen = rawLen;   // ratio 1:1 — nothing was compressed
+                }
+                else
+                {
+                    try
+                    {
+                        using var src = new MemoryStream(bytes, start + deflateOffset, deflateLen, writable: false);
+                        using var inflater = new DeflateStream(src, CompressionMode.Decompress, leaveOpen: false);
+                        using var dst = new MemoryStream();
+                        var buf = new byte[8192];
+                        int read;
+                        int written = 0;
+                        while ((read = inflater.Read(buf, 0, buf.Length)) > 0)
+                        {
+                            written += read;
+                            if (written > budget)
+                            {
+                                // Over the per-file budget: keep what fits and stop this stream.
+                                dst.Write(buf, 0, read - (written - budget));
+                                break;
+                            }
+                            dst.Write(buf, 0, read);
+
+                            // Re-check the wall-clock and cancellation budgets while streaming —
+                            // a single huge inflate must not block past the cap.
+                            cancellationToken.ThrowIfCancellationRequested();
+                            if (state.Deadline.ElapsedMilliseconds > state.TimeoutMs) break;
+                        }
+                        inflated = dst.ToArray();
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch
+                    {
+                        // Ordinary stream: nothing readable here, and that is fine — a DCTDecode
+                        // image failing to inflate is normal and rejecting it would fail most PDFs.
+                        //
+                        // Object stream: NOT fine. Declaring /FlateDecode over bytes that are not
+                        // deflate is the cheapest possible bypass, and trusting the declaration is
+                        // what made the first version of this gate ineffective. Record it as
+                        // unscanned so the file is refused.
+                        if (strict) state.ObjStmUnscanned++;
+                        continue;
+                    }
+                }
+
+                if (inflated.Length == 0)
+                {
+                    // Inflating to nothing means the contents were still not examined.
+                    if (strict) state.ObjStmUnscanned++;
+                    continue;
+                }
                 state.TotalDecompressed += inflated.Length;
 
                 // Decompression-ratio bomb check. Legitimate FlateDecode over document
@@ -1594,54 +1732,68 @@ namespace SecureFileUpload.Services
         /// so that hiding a declaration inside an object stream gains an attacker nothing.
         /// </summary>
         /// <summary>
-        /// True when the stream whose data begins at <paramref name="dataStart"/> is a PDF
-        /// object stream (<c>/Type /ObjStm</c>) whose declared filter this validator cannot
-        /// inflate, so its contents would go unscanned.
+        /// Classifies the stream whose data begins at <paramref name="dataStart"/> using the
+        /// dictionary that precedes it.
         /// </summary>
         /// <remarks>
-        /// Only the stream's own dictionary is consulted, read backwards from the stream data
-        /// within a bounded window. Failing to locate the dictionary returns false: this gate
-        /// rejects on positive evidence of an uninspectable object stream, never on ambiguity,
-        /// so a parsing shortfall here cannot fail a legitimate document.
+        /// Reads from <paramref name="dictContent"/> — the surface with literal strings,
+        /// comments and stream payloads already blanked to spaces at 1:1 offsets — rather than
+        /// from raw bytes. A raw scan mis-pairs on a "&gt;&gt;" inside a literal string such as
+        /// <c>/Title (a&gt;&gt;b)</c>, which would either disarm the gate or mis-attribute a
+        /// neighbouring object's dictionary.
         /// </remarks>
-        private static bool IsUninspectableObjectStream(byte[] bytes, int dataStart)
+        private static PdfStreamKind ClassifyStream(string dictContent, int dataStart)
         {
-            string? dict = ReadStreamDictionary(bytes, dataStart);
-            if (dict is null) return false;
+            string? dict = ReadStreamDictionary(dictContent, dataStart);
 
-            // Only object streams are gated — see RejectUninspectableObjectStreams.
-            if (!ContainsPdfName(dict, "ObjStm")) return false;
+            // Unreadable dictionary is NOT treated as benign. The caller decides, and for a
+            // document that declares /ObjStm it routes these into the strict pass — otherwise
+            // padding a dictionary past the lookback window would switch the gate off.
+            if (dict is null) return PdfStreamKind.Unknown;
 
-            return !IsInspectableFilter(dict);
+            if (!ContainsPdfName(dict, "ObjStm")) return PdfStreamKind.Ordinary;
+
+            return IsInspectableFilter(dict)
+                ? PdfStreamKind.ObjectStreamInspectable
+                : PdfStreamKind.ObjectStreamUninspectable;
+        }
+
+        private enum PdfStreamKind
+        {
+            /// <summary>Dictionary could not be located; treated strictly when /ObjStm is declared.</summary>
+            Unknown,
+            /// <summary>Not an object stream. Inflation failure stays fail-open for these.</summary>
+            Ordinary,
+            /// <summary>Object stream this validator should be able to read.</summary>
+            ObjectStreamInspectable,
+            /// <summary>Object stream declaring a filter this validator cannot inflate.</summary>
+            ObjectStreamUninspectable
         }
 
         /// <summary>
-        /// Reads the dictionary preceding a stream's data by scanning backwards from the
-        /// "stream" keyword to its opening "&lt;&lt;". Returns null when no plausible
-        /// dictionary is found within the lookback window.
+        /// Reads the dictionary preceding a stream by walking backwards from its data with
+        /// balanced &lt;&lt;/&gt;&gt; nesting. Returns null when no balanced dictionary is found
+        /// within the lookback window.
         /// </summary>
-        private static string? ReadStreamDictionary(byte[] bytes, int dataStart)
+        private static string? ReadStreamDictionary(string dictContent, int dataStart)
         {
-            const int MaxLookback = 4096;
+            // Generous window: a dictionary padded past it lands in PdfStreamKind.Unknown,
+            // which the strict pass rejects rather than skips, so padding buys nothing.
+            const int MaxLookback = 65536;
+
+            if (dataStart <= 0 || dataStart > dictContent.Length) return null;
 
             int windowStart = Math.Max(0, dataStart - MaxLookback);
-            int windowLen = dataStart - windowStart;
-            if (windowLen <= 4) return null;
+            string window = dictContent.Substring(windowStart, dataStart - windowStart);
 
-            string window = Encoding.Latin1.GetString(bytes, windowStart, windowLen);
-
-            // The dictionary closes immediately before the "stream" keyword.
             int dictEnd = window.LastIndexOf(">>", StringComparison.Ordinal);
             if (dictEnd < 0) return null;
 
-            // Walk backwards matching nesting depth. A naive LastIndexOf("<<") would stop at
-            // an INNER dictionary — /DecodeParms << /Predictor 12 >> is exactly the shape this
-            // gate cares about — and return a fragment with the outer /Filter missing, which
-            // reads as "no filter declared" and silently disarms the check.
+            // Match nesting backwards. A naive LastIndexOf("<<") stops at an INNER dictionary —
+            // /DecodeParms << /Predictor 12 >> is exactly that shape — and returns a fragment
+            // with the outer /Filter missing, which reads as "no filter declared".
             int depth = 0;
-            // dictEnd indexes the FIRST '>' of ">>"; the scan below matches on the second,
-            // so start one to the right.
-            int cursor = dictEnd + 1;
+            int cursor = dictEnd + 1;   // dictEnd indexes the first '>'; match on the second
             while (cursor >= 1)
             {
                 if (window[cursor] == '>' && window[cursor - 1] == '>')
@@ -1666,20 +1818,20 @@ namespace SecureFileUpload.Services
         }
 
         /// <summary>
-        /// True when every filter the dictionary declares is one this validator can actually
-        /// inflate. FlateDecode qualifies, but only with an identity Predictor: a non-identity
-        /// Predictor means the inflated bytes still need un-predicting before they are the
-        /// real content, which this scanner does not do.
+        /// True when the declared filter chain is one this validator can actually inflate:
+        /// FlateDecode alone, with an identity Predictor or none.
         /// </summary>
+        /// <remarks>
+        /// A declaration is only a claim — <see cref="ScanCompressedPdfStreamsCore"/> additionally
+        /// requires that an object stream's contents were genuinely scanned, so declaring
+        /// /FlateDecode over non-deflate bytes does not get a file through.
+        /// </remarks>
         private static bool IsInspectableFilter(string dict)
         {
-            // No filter at all: the data is stored literally and the scanner reads it fine.
+            // No /Filter: the payload is stored literally. The scan loop reads those bytes
+            // directly rather than attempting deflate, so this is inspectable.
             if (!dict.Contains("/Filter", StringComparison.Ordinal)) return true;
 
-            // Any filter other than FlateDecode is outside what the inflater handles. Checking
-            // for the presence of a non-Flate filter name is deliberately conservative: an
-            // array like [/ASCII85Decode /FlateDecode] is treated as not inspectable, because
-            // the outer ASCII85 layer is not undone before inflation is attempted.
             foreach (string filter in UninflatableFilterNames)
             {
                 if (ContainsPdfName(dict, filter)) return false;
@@ -1687,8 +1839,11 @@ namespace SecureFileUpload.Services
 
             if (!ContainsPdfName(dict, "FlateDecode")) return false;
 
-            // FlateDecode with a non-identity Predictor: inflatable, but the result is not
-            // yet the content, so treat it as uninspectable rather than scanning noise.
+            // /DecodeParms as an indirect reference ("/DecodeParms 99 0 R") hides whatever
+            // predictor the referenced object declares. Resolving it means parsing the object
+            // graph, so treat anything not an inline dictionary as not inspectable.
+            if (HasIndirectDecodeParms(dict)) return false;
+
             if (dict.Contains("/Predictor", StringComparison.Ordinal) &&
                 !IsIdentityPredictorOnly(dict))
             {
@@ -1699,8 +1854,54 @@ namespace SecureFileUpload.Services
         }
 
         /// <summary>
-        /// True when every /Predictor value present is 1 (identity). PNG/TIFF predictors are
-        /// values 2 and 10-15.
+        /// True when a /DecodeParms (or /DP) value is an indirect reference rather than an
+        /// inline dictionary or array.
+        /// </summary>
+        private static bool HasIndirectDecodeParms(string dict)
+        {
+            foreach (string key in DecodeParmsKeys)
+            {
+                int idx = 0;
+                while ((idx = dict.IndexOf(key, idx, StringComparison.Ordinal)) >= 0)
+                {
+                    int cursor = idx + key.Length;
+
+                    // Reject "/DecodeParmsFoo" matching "/DecodeParms".
+                    if (cursor < dict.Length && IsPdfNameChar(dict[cursor])) { idx = cursor; continue; }
+
+                    while (cursor < dict.Length && char.IsWhiteSpace(dict[cursor])) cursor++;
+
+                    // An inline dictionary or array is readable; a digit starts "N G R".
+                    if (cursor < dict.Length && char.IsDigit(dict[cursor])) return true;
+
+                    idx = cursor;
+                }
+            }
+
+            return false;
+        }
+
+        private static readonly string[] DecodeParmsKeys = { "/DecodeParms", "/DP" };
+
+        /// <summary>
+        /// True when the dictionary preceding the stream at <paramref name="dataStart"/>
+        /// declares a /Filter. A stream with none is stored literally.
+        /// </summary>
+        private static bool DeclaresAnyFilter(string dictContent, int dataStart)
+        {
+            string? dict = ReadStreamDictionary(dictContent, dataStart);
+
+            // Unknown dictionary: assume a filter is present so the literal shortcut is not
+            // taken on a stream we failed to parse. The inflate path then decides, and for a
+            // strict stream a failure there counts as unscanned.
+            if (dict is null) return true;
+
+            return dict.Contains("/Filter", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// True when every /Predictor value present is 1 (identity). PNG/TIFF predictors are 2
+        /// and 10-15, and leave inflated bytes still predictor-encoded.
         /// </summary>
         private static bool IsIdentityPredictorOnly(string dict)
         {
@@ -1713,7 +1914,7 @@ namespace SecureFileUpload.Services
                 int digitStart = cursor;
                 while (cursor < dict.Length && char.IsDigit(dict[cursor])) cursor++;
 
-                // No parsable value — treat as non-identity rather than assuming the safe case.
+                // Unparsable value: assume the unsafe case rather than the safe one.
                 if (cursor == digitStart) return false;
 
                 if (!int.TryParse(dict.AsSpan(digitStart, cursor - digitStart), out int value) ||
@@ -1729,15 +1930,17 @@ namespace SecureFileUpload.Services
         }
 
         /// <summary>
-        /// Matches a PDF name token exactly, so "/ObjStm" does not match "/ObjStmExtra" and
-        /// "/FlateDecode" does not match a longer name that merely starts the same way.
+        /// Matches a PDF name token exactly, so "/ObjStm" does not match "/ObjStmExtra".
         /// </summary>
         private static bool ContainsPdfName(string dict, string name)
         {
             int idx = 0;
-            while ((idx = dict.IndexOf("/" + name, idx, StringComparison.Ordinal)) >= 0)
+            while ((idx = dict.IndexOf(name, idx, StringComparison.Ordinal)) >= 0)
             {
-                int after = idx + name.Length + 1;
+                // Must be preceded by the name-introducing solidus.
+                if (idx == 0 || dict[idx - 1] != '/') { idx += name.Length; continue; }
+
+                int after = idx + name.Length;
                 if (after >= dict.Length || !IsPdfNameChar(dict[after])) return true;
                 idx = after;
             }
@@ -1749,8 +1952,7 @@ namespace SecureFileUpload.Services
             char.IsLetterOrDigit(c) || c == '.' || c == '-' || c == '_' || c == '#';
 
         /// <summary>
-        /// Stream filters this validator cannot inflate. Their presence on an object stream
-        /// means its contents cannot be scanned.
+        /// Stream filters this validator cannot inflate.
         /// </summary>
         private static readonly string[] UninflatableFilterNames =
         {
@@ -1758,6 +1960,11 @@ namespace SecureFileUpload.Services
             "CCITTFaxDecode", "JBIG2Decode", "DCTDecode", "JPXDecode", "Crypt"
         };
 
+        /// <summary>
+        /// Applies the dangerous/suspicious name policy to names extracted from a decompressed
+        /// PDF stream, mirroring the checks <c>ValidatePdf</c> runs against the document surface
+        /// so that hiding a declaration inside an object stream gains an attacker nothing.
+        /// </summary>
         private ContentValidationResult? ScanInflatedPdfNames(
             HashSet<string> names, string fileName, int depth)
         {
