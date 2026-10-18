@@ -361,6 +361,8 @@ With user binding enabled, the replay window shrinks to "the same authenticated 
 
 This section names primitives, parameters, and residual risks. It is the single source of truth for the cryptographic posture; the marketing tagline is at the top of this README.
 
+> **Encryption at rest is opt-in.** `FileUpload:EncryptionEnabled` defaults to `false`, and with that default every accepted file is written to `StorageRoot` in **plaintext**. Nothing below applies until you set `EncryptionEnabled=true` and supply a real `EncryptionSecret` (startup then refuses to run with a missing or placeholder secret). The service logs a `SECURITY_EVENT | ENCRYPTION_DISABLED` warning at startup whenever encryption is off, so a deployment that expected encryption and did not get it is visible in the first lines of the log. Volume-level encryption (BitLocker / LUKS) is not a substitute: it protects against a stolen disk, not against anyone who can read the filesystem on a running host.
+
 | Aspect | Implementation | Notes |
 |---|---|---|
 | Crypto classification | **Classical, not post-quantum.** AES-256-GCM provides quantum-resistant *confidentiality* by key size (Grover's algorithm halves the effective key size to 128 bits, which remains comfortable). There is **no PQ asymmetric layer** — no ML-KEM, no ML-DSA, no asymmetric primitives at all. | This package is intentionally separate from the `PostQuantum.*` family. No PQC migration path is planned for v3.x. See [`SECURITY.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/SECURITY.md) for the explicit posture. |
@@ -459,6 +461,7 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](https://g
 | Setting | Purpose |
 |---|---|
 | `FileUpload:StorageRoot` | Resolved relative to `ContentRootPath`. Must land outside `wwwroot`. The service refuses to start otherwise. |
+| `FileUpload:EncryptionEnabled` | `false` (default). **Files are stored in plaintext until this is `true`.** Startup logs an `ENCRYPTION_DISABLED` security-event warning while it is off. |
 | `FileUpload:EncryptionSecret` | ≥ 32 chars, must not contain `CHANGE_THIS`. Store in a secrets manager — **never** in checked-in config. |
 | `FileUpload:KeyDerivation:Algorithm` | `Argon2id` (default) or `Pbkdf2` (FIPS-restricted environments only). |
 | `FileUpload:KeyDerivation:Argon2id:*` | Tune for your CPU/RAM budget. Library logs derivation time at startup. |

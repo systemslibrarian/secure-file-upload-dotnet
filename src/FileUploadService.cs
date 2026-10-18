@@ -537,6 +537,19 @@ namespace SecureFileUpload.Services
                 CryptographicOperations.ZeroMemory(passwordBytes);
             }
 
+            if (!_encryptionEnabled)
+            {
+                // Encryption is opt-in. Say so loudly at startup so an operator who
+                // expected at-rest encryption notices before the first patron document
+                // lands on disk in plaintext. Warning, not an error: plaintext storage is
+                // a supported configuration, just one that should never be accidental.
+                _logger.LogWarning(
+                    "SECURITY_EVENT | ENCRYPTION_DISABLED | FileUpload:EncryptionEnabled is false (the default). " +
+                    "Uploaded files will be stored in PLAINTEXT under {StorageRoot}. " +
+                    "Set FileUpload:EncryptionEnabled=true and configure FileUpload:EncryptionSecret to encrypt at rest.",
+                    _storageRoot);
+            }
+
             _logger.LogInformation(
                 "FileUploadService initialized | StorageRoot: {Path} | MaxSize: {Size}MB | MaxCount: {Count} | MaxTotal: {TotalMB}MB | " +
                 "MinStorageFree: {MinStorageMB}MB | MinTempFree: {MinTempMB}MB | LowDiskWarn: {WarnMB}MB | " +

@@ -7,6 +7,23 @@ binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`, the
 whole `3.2.x` line holds at `3.2.0.0` because it changes no IL, and the `3.3.x`
 line holds at `3.3.0.0`.
 
+## Unreleased
+
+### Added
+
+- **Startup warning when encryption is disabled.** `FileUpload:EncryptionEnabled` has
+  always defaulted to `false`, and the only sign of it was `Encryption: disabled` inside
+  the initialization summary. The service now also logs a
+  `SECURITY_EVENT | ENCRYPTION_DISABLED` warning naming the storage root, so plaintext
+  storage is a visible choice rather than a silent default. No behavior change; the
+  default is unchanged.
+
+### Documentation
+
+- README now states up front, in the crypto-posture section and the configuration table,
+  that encryption at rest is opt-in and what the default means for files on disk.
+  Prompted by the October 2026 audit (SFU-OCT-003).
+
 ## 3.3.1 — 2026-08-19 — Decode cap raised; 3.3.0 notes corrected
 
 `AssemblyVersion` stays at `3.3.0.0`. Drop-in upgrade from `3.3.0`.
