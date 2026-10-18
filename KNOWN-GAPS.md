@@ -174,12 +174,36 @@ This document exists because intellectual honesty matters more than looking good
 | Infected signature result | **Reject** | `InfectedRejectedCount` |
 | Scanner unreachable / timeout / exception / unparseable response | **Accept** | `ScanNotScannedCount` |
 
-In other words: **detection is fail-closed; availability is fail-open**. A clear malware signature always blocks the upload. A `clamd` outage or `MpCmdRun.exe` timeout does *not* block the upload \u2014 the file is accepted on the strength of Layers 1\u20136 and explicitly recorded as `NotScanned`. The outcome is logged as `VIRUS_SCAN_OPERATIONAL_FAILURE` and surfaced in `FileUploadResult` so staff dashboards can flag the batch for re-scanning.
+In other words: **detection is fail-closed; availability is fail-open**. A clear malware signature always blocks the upload. A `clamd` outage or `MpCmdRun.exe` timeout does *not* block the upload — the file is accepted on the strength of Layers 1–6 and explicitly recorded as `NotScanned`. The outcome is logged as `VIRUS_SCAN_OPERATIONAL_FAILURE` and surfaced in `FileUploadResult` so staff dashboards can flag the batch for re-scanning.
 
-**Why this is the chosen trade-off:** The original deployment is a public-library patron-registration workflow. A scanner outage during business hours must not block patrons from registering for a library card; the operational cost of false rejections in that context outweighs the residual risk, given that Layers 1\u20136 already exclude every class of file the scanner is designed to catch except *novel signatures of known-bad payloads inside formats we accept*.
+**Why this is the chosen trade-off:** The original deployment is a public-library patron-registration workflow. A scanner outage during business hours must not block patrons from registering for a library card; the operational cost of false rejections in that context outweighs the residual risk, given that Layers 1–6 already exclude every class of file the scanner is designed to catch except *novel signatures of known-bad payloads inside formats we accept*.
 
 **What you should do if this trade-off does not match your context:**
 
-1. **Switch to a queued-scan model** (recommended for higher-risk workloads): accept the file into a `pending/` quarantine, run the scanner asynchronously, and only release to `cleared/` on a clean result. See [`docs/hardening-roadmap.md`](docs/hardening-roadmap.md) \u00a71.3. This converts \"scanner down\" from \"accept\" into \"hold for review\" without blocking the request path.\n2. **Make availability fail-closed** by changing `RunVirusScanAsync` in `FileUploadService` to return `Infected` (or a new `ScannerUnavailable` outcome that the caller rejects) on the operational-failure paths. This is a one-method change but inverts the availability/UX trade-off and should be a conscious deployment decision, not a default.\n\n---\n\n## Not a Gap: Relying on Browser-Reported Content-Type (Layer 3)
+1. **Switch to a queued-scan model** (recommended for higher-risk workloads): accept the file into a `pending/` quarantine, run the scanner asynchronously, and only release to `cleared/` on a clean result. See [`docs/hardening-roadmap.md`](docs/hardening-roadmap.md) §1.3. This converts "scanner down" from "accept" into "hold for review" without blocking the request path.
+2. **Make availability fail-closed** by changing `RunVirusScanAsync` in `FileUploadService` to return `Infected` (or a new `ScannerUnavailable` outcome that the caller rejects) on the operational-failure paths. This is a one-method change but inverts the availability/UX trade-off and should be a conscious deployment decision, not a default.
+
+---
+
+## Gap 10: Encryption at Rest Is Opt-In (default `EncryptionEnabled=false`)
+
+> **Updated in 3.4.0:** the service now logs `SECURITY_EVENT | ENCRYPTION_DISABLED` at
+> Warning level on every start while encryption is off, naming the storage root. The
+> default itself is unchanged in `3.x` and is **planned to flip to `true` in `4.0`**; see
+> [`docs/adr/0001-encryption-at-rest-is-opt-in.md`](docs/adr/0001-encryption-at-rest-is-opt-in.md).
+
+**What it means:** Layer 8 only encrypts when `FileUpload:EncryptionEnabled` is `true`. Out of the box it is `false`, so every accepted file is written to `StorageRoot` in plaintext with a randomized filename. The read path serves plaintext and envelope-encrypted files interchangeably (`FILE_DECRYPT_LEGACY` vs `FILE_DECRYPT_V2`), so a store can hold both and nothing in the download surface reveals which is which.
+
+**Why this is the chosen trade-off:** The original deployment ran on an encrypted, backed-up volume with no key-management infrastructure. Turning on application-layer encryption there would have made loss of `EncryptionSecret` equivalent to loss of every patron document written under it. That is a reasoned choice for a small single-host deployment, and the library leaves it to the operator. What it must not do is let an operator believe encryption is on when it is not, which is what the `3.4.0` warning and the corrected README address.
+
+**What you should do:**
+
+1. **Enable it** unless you have decided not to: set `EncryptionEnabled=true`, put a real `EncryptionSecret` in a secrets manager, and back the secret up with the same care as the files.
+2. **If you leave it off**, treat the `ENCRYPTION_DISABLED` warning as an acknowledged alert, run the storage volume encrypted, and restrict filesystem access to the service account.
+3. **If you turn it on later**, know that files written before the switch stay plaintext. There is no re-encryption pass in `3.x`; one is a precondition for the `4.0` default flip.
+
+---
+
+## Not a Gap: Relying on Browser-Reported Content-Type (Layer 3)
 
 One common objection: "You can't trust the browser Content-Type header." This is true — but the design accounts for it. Layer 3 does not *accept* a file based on MIME type alone. It *cross-validates* that the browser-reported MIME type is consistent with the claimed extension. A mismatch is a rejection signal. The actual file type is determined independently by magic bytes (Layer 4) and deep content (Layer 6). Layer 3 is a consistency check, not a trust gate.

@@ -224,6 +224,8 @@ The following are assumed by the codebase. Violating any of them materially degr
 | 7 | PDF pattern scan missed FlateDecode compressed streams | Low | ✅ **Resolved** — `ScanCompressedPdfStreams` decompresses and re-scans, bounded by configurable limits |
 | **A** | Scanner availability fail-open (new finding) | Medium | ⚠️ **Documented** — intentional design decision, explicit NotScanned tracking, documented in `KNOWN-GAPS.md §Gap 9` |
 | **B** | Scanner XML doc comments contradict pipeline behavior (new finding) | Low | 🔧 **Required fix** — comments need updating in `ClamAvScanService.cs` and `WindowsDefenderScanService.cs` |
+| **C** | Encryption at rest is opt-in (`EncryptionEnabled=false` by default) while the README claimed files never sit unencrypted on disk (Oct 2026 audit, SFU-OCT-003) | High as shipped by default | ⚠️ **Documented, default unchanged** — README corrected and `ENCRYPTION_DISABLED` startup warning added in `3.4.0`; decision and 4.0 default flip recorded in `docs/adr/0001-encryption-at-rest-is-opt-in.md`; `KNOWN-GAPS.md §Gap 10` |
+| **D** | Unchecked overflow in the batch-size sum could bypass `MaxTotalUploadBytes` (Oct 2026 audit, SFU-OCT-001) | Claimed High | ❌ **Refuted** — `Enumerable.Sum` over `long` is checked; the `OverflowException` is caught in `UploadFilesAsync` and the upload is rejected; see `docs/audits/2026-10-16-sfu-oct-2026-audit.md` |
 
 ---
 

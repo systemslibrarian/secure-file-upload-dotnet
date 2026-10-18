@@ -8,7 +8,7 @@
 [![Targets: net8.0 / net9.0 / net10.0](https://img.shields.io/badge/targets-net8.0%20%7C%20net9.0%20%7C%20net10.0-512BD4.svg?style=flat-square)](https://dotnet.microsoft.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/LICENSE)
 
-`SecureFileUpload.Core` gives ASP.NET Core a production-ready, defense-in-depth file-upload pipeline. It **validates, scans, encrypts, and safely stores** uploaded files behind eight serial security layers — attacker-controlled bytes never land in `wwwroot`, never get served back verbatim, and never sit unencrypted on disk. One `AddSecureFileUpload()` call wires the whole thing up.
+`SecureFileUpload.Core` gives ASP.NET Core a production-ready, defense-in-depth file-upload pipeline. It **validates, scans, encrypts, and safely stores** uploaded files behind eight serial security layers — attacker-controlled bytes never land in `wwwroot` and never get served back verbatim. Encryption at rest is **opt-in**: files sit unencrypted on disk until you set `FileUpload:EncryptionEnabled=true` (see [Encryption at rest is opt-in](#encryption-at-rest-is-opt-in)). One `AddSecureFileUpload()` call wires the whole thing up.
 
 **The eight layers, in pipeline order:**
 
@@ -19,7 +19,7 @@
 5. **Filename / path sanitization** — NFKC-normalized; blocks traversal, double extensions, NTFS ADS, Unicode bidi, Windows reserved names
 6. **Deep structural content validation** — JPEG/PNG/WebP/GIF/BMP walkers plus a token-aware PDF scanner that inflates FlateDecode streams, under hard caps for ratio, time, and recursion depth
 7. **Malware scanning** — Windows Defender or ClamAV, pluggable; detection always fail-closed
-8. **AES-256-GCM encrypted storage** — per-file random DEK wrapped under an Argon2id-derived master KEK, randomized filename, outside the web root
+8. **AES-256-GCM encrypted storage (opt-in)** — per-file random DEK wrapped under an Argon2id-derived master KEK, randomized filename, outside the web root. **Off by default**; without it, layer 8 is "randomized filename, outside the web root, plaintext."
 
 Reads go back out through a hardened reference download surface that takes opaque, signed, time-limited tokens instead of storage paths — optionally bound to the issuing user.
 
@@ -361,7 +361,13 @@ With user binding enabled, the replay window shrinks to "the same authenticated 
 
 This section names primitives, parameters, and residual risks. It is the single source of truth for the cryptographic posture; the marketing tagline is at the top of this README.
 
-> **Encryption at rest is opt-in.** `FileUpload:EncryptionEnabled` defaults to `false`, and with that default every accepted file is written to `StorageRoot` in **plaintext**. Nothing below applies until you set `EncryptionEnabled=true` and supply a real `EncryptionSecret` (startup then refuses to run with a missing or placeholder secret). The service logs a `SECURITY_EVENT | ENCRYPTION_DISABLED` warning at startup whenever encryption is off, so a deployment that expected encryption and did not get it is visible in the first lines of the log. Volume-level encryption (BitLocker / LUKS) is not a substitute: it protects against a stolen disk, not against anyone who can read the filesystem on a running host.
+### Encryption at rest is opt-in
+
+`FileUpload:EncryptionEnabled` defaults to `false`. With that default every accepted file is written to `StorageRoot` in **plaintext**, and nothing in the table below applies until you set `EncryptionEnabled=true` and supply a real `EncryptionSecret` (startup then refuses to run with a missing or placeholder secret).
+
+Since `3.4.0` the service logs a `SECURITY_EVENT | ENCRYPTION_DISABLED` warning at every startup while encryption is off, naming the storage root. **That warning is disclosure, not protection.** A deployment that ignores it is exactly as exposed as one running `3.3.x`; the only thing that changes what is on disk is turning encryption on.
+
+The default stays `false` through `3.x` and is **planned to flip to `true` in `4.0`**. The reasoning, the migration hazards (startup failure for deployments without a secret, mixed plaintext/encrypted stores that the read path silently tolerates, and secret loss becoming data loss), and the preconditions for the flip are recorded in [`docs/adr/0001-encryption-at-rest-is-opt-in.md`](https://github.com/systemslibrarian/secure-file-upload-dotnet/blob/main/docs/adr/0001-encryption-at-rest-is-opt-in.md). Volume-level encryption (BitLocker / LUKS) under a plaintext store protects against a stolen disk, not against anyone who can read the filesystem on a running host.
 
 | Aspect | Implementation | Notes |
 |---|---|---|
@@ -461,7 +467,7 @@ For the full code-traced security review, see [`SECURITY-ANALYSIS.md`](https://g
 | Setting | Purpose |
 |---|---|
 | `FileUpload:StorageRoot` | Resolved relative to `ContentRootPath`. Must land outside `wwwroot`. The service refuses to start otherwise. |
-| `FileUpload:EncryptionEnabled` | `false` (default). **Files are stored in plaintext until this is `true`.** Startup logs an `ENCRYPTION_DISABLED` security-event warning while it is off. |
+| `FileUpload:EncryptionEnabled` | `false` (default through `3.x`; planned `true` in `4.0`). **Files are stored in plaintext until this is `true`.** Startup logs an `ENCRYPTION_DISABLED` security-event warning while it is off; the warning does not change what is written. |
 | `FileUpload:EncryptionSecret` | ≥ 32 chars, must not contain `CHANGE_THIS`. Store in a secrets manager — **never** in checked-in config. |
 | `FileUpload:KeyDerivation:Algorithm` | `Argon2id` (default) or `Pbkdf2` (FIPS-restricted environments only). |
 | `FileUpload:KeyDerivation:Argon2id:*` | Tune for your CPU/RAM budget. Library logs derivation time at startup. |

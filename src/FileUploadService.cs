@@ -546,7 +546,8 @@ namespace SecureFileUpload.Services
                 _logger.LogWarning(
                     "SECURITY_EVENT | ENCRYPTION_DISABLED | FileUpload:EncryptionEnabled is false (the default). " +
                     "Uploaded files will be stored in PLAINTEXT under {StorageRoot}. " +
-                    "Set FileUpload:EncryptionEnabled=true and configure FileUpload:EncryptionSecret to encrypt at rest.",
+                    "Set FileUpload:EncryptionEnabled=true and configure FileUpload:EncryptionSecret to encrypt at rest. " +
+                    "This default is planned to become true in 4.0; see docs/adr/0001-encryption-at-rest-is-opt-in.md.",
                     _storageRoot);
             }
 

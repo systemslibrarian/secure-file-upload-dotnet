@@ -19,15 +19,15 @@
 
     <!-- ── NuGet package metadata ─────────────────────────────────────── -->
     <PackageId>SecureFileUpload.Core</PackageId>
-    <Version>3.3.1</Version>
+    <Version>3.4.0</Version>
     <!--
-      AssemblyVersion stays at 3.3.0.0 across the 3.3.x line. 3.3.1 changes one
-      default value and documentation; no public surface changed, so it is a
-      drop-in upgrade from 3.3.0.
+      3.4.0 moves AssemblyVersion to 3.4.0.0. No public surface changed; the minor
+      bump marks the release that makes the opt-in encryption default visible
+      (startup warning, README correction, ADR 0001) so it is read, not skipped.
     -->
-    <AssemblyVersion>3.3.0.0</AssemblyVersion>
-    <FileVersion>3.3.1.0</FileVersion>
-    <InformationalVersion>3.3.1</InformationalVersion>
+    <AssemblyVersion>3.4.0.0</AssemblyVersion>
+    <FileVersion>3.4.0.0</FileVersion>
+    <InformationalVersion>3.4.0</InformationalVersion>
     <Authors>Paul Clark (systemslibrarian)</Authors>
     <Company>systemslibrarian</Company>
     <Product>SecureFileUpload.Core</Product>

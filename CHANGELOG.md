@@ -4,25 +4,61 @@ All notable changes to `SecureFileUpload.Core` are recorded here. The package
 follows semantic versioning. `AssemblyVersion` is held at `3.0.0.0` across the
 entire `3.0.x` line so patch releases are drop-in upgrades with no
 binding-redirect churn; `3.1.0` moves `AssemblyVersion` to `3.1.0.0`, the
-whole `3.2.x` line holds at `3.2.0.0` because it changes no IL, and the `3.3.x`
-line holds at `3.3.0.0`.
+whole `3.2.x` line holds at `3.2.0.0` because it changes no IL, the `3.3.x`
+line holds at `3.3.0.0`, and `3.4.0` moves it to `3.4.0.0`.
 
-## Unreleased
+## 3.4.0 — 2026-10-18 — Encryption-at-rest default made visible
+
+`AssemblyVersion` moves to `3.4.0.0`. No public API changed. The minor bump instead of a
+patch is deliberate: this entry is about operators learning their files may be in plaintext,
+and minor releases get read where patches get skipped.
+
+### Behavior change
+
+- **One new Warning-level log record per process start when encryption is disabled.**
+  `FileUploadService` now logs `SECURITY_EVENT | ENCRYPTION_DISABLED`, naming the resolved
+  storage root and the planned 4.0 default change, whenever `FileUpload:EncryptionEnabled`
+  is `false`. That is the default, so most deployments will see it. Anyone alerting on
+  `SECURITY_EVENT`, treating warnings as startup failures, or shipping logs to a monitored
+  sink should expect one new record per start until they enable encryption or acknowledge
+  the configuration. Nothing else changes: no default value changed, nothing about what is
+  written to or read from disk changed, and the upload and download paths are untouched.
+
+### Corrected
+
+- **The README overstated the default posture.** Its opening paragraph said uploaded files
+  "never sit unencrypted on disk." That is true only with `EncryptionEnabled=true`, which is
+  not the default. The claim is removed; layer 8 is now described as opt-in in the pipeline
+  list, the crypto-posture section, and the configuration table. The October 2026 audit
+  stated the README made no such claim; it did.
 
 ### Added
 
-- **Startup warning when encryption is disabled.** `FileUpload:EncryptionEnabled` has
-  always defaulted to `false`, and the only sign of it was `Encryption: disabled` inside
-  the initialization summary. The service now also logs a
-  `SECURITY_EVENT | ENCRYPTION_DISABLED` warning naming the storage root, so plaintext
-  storage is a visible choice rather than a silent default. No behavior change; the
-  default is unchanged.
+- **Decision record** `docs/adr/0001-encryption-at-rest-is-opt-in.md`: why the default stays
+  `false` through `3.x` (startup failure for deployments without a secret, mixed
+  plaintext/encrypted stores the read path silently tolerates, secret loss becoming data
+  loss), and what has to exist before `4.0` flips it.
+- **`KNOWN-GAPS.md` Gap 10** naming the opt-in default, so the "every limitation is named
+  there" promise holds. Gap 9's text, which had been committed with literal `\n` and
+  `\u2014` escape sequences, is rendered properly again.
+- **`EncryptionDisabledWarningTests`** (3 tests) run the real constructor with a capturing
+  logger: disabled explicitly emits exactly one record at Warning level naming the storage
+  root; the out-of-the-box configuration with no `StorageRoot` set emits it naming the
+  resolved fallback root and does not throw; enabled emits nothing. Both positive tests were
+  shown failing with the log call removed and again with the level downgraded to
+  Information before being trusted.
+- **Audit record** `docs/audits/2026-10-16-sfu-oct-2026-audit.md`: the October 2026 report
+  as delivered, with a maintainer adjudication header. Its one claimed code defect
+  (SFU-OCT-001, unchecked overflow in the batch-size sum) is refuted there: `Enumerable.Sum`
+  over `long` is checked, the exception is caught, and the upload is rejected.
 
-### Documentation
+### Planned breaking change — 4.0
 
-- README now states up front, in the crypto-posture section and the configuration table,
-  that encryption at rest is opt-in and what the default means for files on disk.
-  Prompted by the October 2026 audit (SFU-OCT-003).
+- **`FileUpload:EncryptionEnabled` will default to `true` in `4.0`.** Deployments that have
+  not configured `EncryptionSecret` will fail the existing startup guard on upgrade; set
+  `EncryptionEnabled=false` explicitly to keep the plaintext mode (the warning continues).
+  Files written in plaintext before the switch are not re-encrypted; a migration utility and
+  a legacy-file metric are preconditions for the flip and are listed in ADR 0001.
 
 ## 3.3.1 — 2026-08-19 — Decode cap raised; 3.3.0 notes corrected
 
